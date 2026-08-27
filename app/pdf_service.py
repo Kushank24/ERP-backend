@@ -14,8 +14,7 @@ from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, 
 
 logger = logging.getLogger(__name__)
 
-# Absolute path to the logo sitting next to this backend directory.
-_LOGO_PATH = os.path.join(os.path.dirname(__file__), "..", "..", "esafe.png")
+_LOGO_PATH = os.path.join(os.path.dirname(__file__), "static", "esafe.png")
 
 
 class PDFGenerationService:

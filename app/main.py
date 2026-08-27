@@ -10,9 +10,12 @@ from sqlalchemy.exc import OperationalError, SQLAlchemyError
 from .config import settings
 from .routers import (
     auth,
+    companies,
     dashboard,
+    enquiries,
     finished_goods,
     materials,
+    offers,
     products,
     purchase_orders,
     sales_orders,
@@ -103,6 +106,16 @@ def _friendly_db_message(exc: BaseException) -> str:
             "Set DATABASE_URL to your Supabase pooler URI in ERP/backend/.env "
             "and restart uvicorn."
         )
+    if "undefinedcolumn" in msg or "undefined column" in msg or "column" in msg and "does not exist" in msg:
+        return (
+            f"Schema mismatch: {str(getattr(exc, 'orig', exc)).splitlines()[0]}. "
+            "Run the pending SQL migration in Supabase SQL Editor."
+        )
+    if "undefinedtable" in msg or "does not exist" in msg:
+        return (
+            f"Missing table: {str(getattr(exc, 'orig', exc)).splitlines()[0]}. "
+            "Run the pending SQL migration in Supabase SQL Editor."
+        )
     return _DB_HELP
 
 
@@ -130,6 +143,9 @@ async def sqlalchemy_generic_error_handler(
 
 app.include_router(auth.router, prefix="/api/v1")
 app.include_router(dashboard.router, prefix="/api/v1")
+app.include_router(companies.router, prefix="/api/v1")
+app.include_router(enquiries.router, prefix="/api/v1")
+app.include_router(offers.router, prefix="/api/v1")
 app.include_router(materials.router, prefix="/api/v1")
 app.include_router(products.router, prefix="/api/v1")
 app.include_router(purchase_orders.router, prefix="/api/v1")

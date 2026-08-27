@@ -24,6 +24,10 @@ class SalesLineIn(BaseModel):
     finished_good_id: Optional[int] = None
 
 
+class SalesLineUpdate(SalesLineIn):
+    id: Optional[int] = None  # None = new line; set = existing line
+
+
 class SalesOrderCreate(BaseModel):
     invoice_number: str = Field(min_length=1)
     company_name: str = Field(min_length=1)
@@ -38,13 +42,27 @@ class SalesOrderCreate(BaseModel):
     lines: List[SalesLineIn] = Field(min_length=1)
 
 
+class SalesOrderUpdate(BaseModel):
+    company_name: str = Field(min_length=1)
+    company_location: str = ""
+    company_contact: str = ""
+    company_gstin: Optional[str] = None
+    sales_date: date
+    delivery_date: Optional[date] = None
+    gst_rate: float = Field(default=18, ge=0)
+    delivery_details: dict = Field(default_factory=dict)
+    notes: Optional[str] = None
+    lines: List[SalesLineUpdate] = Field(min_length=1)
+
+
 def _serialize_so(db: Session, so_id: int) -> dict:
     head = db.execute(
         text(
             """
             SELECT id, invoice_number, company_name, company_location, company_contact, company_gstin,
                    sales_date, delivery_date, actual_delivery_date, total_amount, status, gst_rate,
-                   delivery_details, notes, created_at, updated_at, payment_received
+                   delivery_details, notes, created_at, updated_at, payment_received, payment_amount,
+                   COALESCE(additional_costs, '[]'::jsonb) AS additional_costs
             FROM sales_orders WHERE id = :id
             """
         ),
@@ -64,6 +82,10 @@ def _serialize_so(db: Session, so_id: int) -> dict:
     d = dict(head)
     if isinstance(d.get("delivery_details"), str):
         d["delivery_details"] = json.loads(d["delivery_details"])
+    if isinstance(d.get("additional_costs"), str):
+        d["additional_costs"] = json.loads(d["additional_costs"])
+    if d.get("additional_costs") is None:
+        d["additional_costs"] = []
     d["lines"] = [dict(x) for x in lines]
     subtotal = sum(float(x["total_price"]) for x in d["lines"])
     d["subtotal"] = subtotal
@@ -77,7 +99,7 @@ def list_so(db: Session = Depends(get_db), user: dict = Depends(get_current_user
     rows = db.execute(
         text(
             """
-            SELECT id, invoice_number, company_name, total_amount, status, sales_date, created_at, payment_received
+            SELECT id, invoice_number, company_name, total_amount, status, sales_date, created_at, payment_received, payment_amount
             FROM sales_orders ORDER BY created_at DESC NULLS LAST
             """
         )
@@ -187,19 +209,144 @@ def create_so(
     return _serialize_so(db, so_id)
 
 
+@router.patch("/{so_id}")
+def update_so(
+    so_id: int,
+    body: SalesOrderUpdate,
+    db: Session = Depends(get_db),
+    user: dict = Depends(get_current_user),
+):
+    _ = user
+    if not db.execute(text("SELECT id FROM sales_orders WHERE id = :id"), {"id": so_id}).first():
+        raise HTTPException(404, "Sales order not found")
+
+    current_lines = {
+        r["id"]: dict(r)
+        for r in db.execute(
+            text("SELECT id, dispatched_qty FROM sales_order_items WHERE sales_order_id = :id"),
+            {"id": so_id},
+        ).mappings().all()
+    }
+    incoming_ids = {l.id for l in body.lines if l.id is not None}
+
+    # Block removal of lines that have been partially/fully dispatched
+    for lid, line in current_lines.items():
+        if lid not in incoming_ids and float(line["dispatched_qty"] or 0) > 0:
+            raise HTTPException(
+                400,
+                f"Cannot remove a line that has already been dispatched (line id {lid}).",
+            )
+
+    # Delete safe-to-remove lines
+    for lid in current_lines:
+        if lid not in incoming_ids:
+            db.execute(text("DELETE FROM sales_order_items WHERE id = :id"), {"id": lid})
+
+    new_subtotal = 0.0
+    for line in body.lines:
+        tp = float(line.quantity_sold) * float(line.unit_price)
+        new_subtotal += tp
+        if line.id and line.id in current_lines:
+            dispatched = float(current_lines[line.id]["dispatched_qty"] or 0)
+            if line.quantity_sold < dispatched:
+                raise HTTPException(
+                    400,
+                    f"Quantity for '{line.product_name}' cannot be less than already dispatched ({dispatched}).",
+                )
+            db.execute(
+                text(
+                    "UPDATE sales_order_items SET product_name=:pn, product_code=:pc, "
+                    "quantity_sold=:qty, unit_price=:up, total_price=:tp, notes=:notes "
+                    "WHERE id=:lid"
+                ),
+                {"pn": line.product_name, "pc": line.product_code, "qty": line.quantity_sold,
+                 "up": line.unit_price, "tp": tp, "notes": line.notes, "lid": line.id},
+            )
+        else:
+            db.execute(
+                text(
+                    "INSERT INTO sales_order_items "
+                    "(sales_order_id, finished_good_id, product_name, product_code, quantity_sold, unit_price, total_price, notes) "
+                    "VALUES (:sid, :fgid, :pn, :pc, :qty, :up, :tp, :notes)"
+                ),
+                {"sid": so_id, "fgid": line.finished_good_id, "pn": line.product_name,
+                 "pc": line.product_code, "qty": line.quantity_sold, "up": line.unit_price,
+                 "tp": tp, "notes": line.notes},
+            )
+
+    gst_amt = new_subtotal * (body.gst_rate / 100.0)
+    new_total = new_subtotal + gst_amt
+
+    db.execute(
+        text(
+            "UPDATE sales_orders SET company_name=:cname, company_location=:cloc, company_contact=:ccon, "
+            "company_gstin=:gstin, sales_date=:sdate, delivery_date=:ddate, gst_rate=:grate, "
+            "delivery_details=CAST(:details AS jsonb), notes=:notes, total_amount=:total, updated_at=now() "
+            "WHERE id=:id"
+        ),
+        {
+            "cname": body.company_name.strip(), "cloc": body.company_location, "ccon": body.company_contact,
+            "gstin": body.company_gstin, "sdate": body.sales_date, "ddate": body.delivery_date,
+            "grate": body.gst_rate, "details": json.dumps(body.delivery_details or {}),
+            "notes": body.notes, "total": new_total, "id": so_id,
+        },
+    )
+    db.commit()
+    return _serialize_so(db, so_id)
+
+
 class PaymentUpdate(BaseModel):
-    payment_received: bool
+    # 1 = Not Received, 2 = Partially Received, 3 = Received
+    payment_status: int = Field(ge=1, le=3)
+    payment_amount: Optional[float] = Field(default=None, ge=0)
 
 @router.patch("/{so_id}/payment")
 def update_payment(so_id: int, body: PaymentUpdate, db: Session = Depends(get_db), user: dict = Depends(get_current_user)):
     _ = user
-    row = db.execute(text("SELECT id FROM sales_orders WHERE id = :id"), {"id": so_id}).first()
+    row = db.execute(text("SELECT id, total_amount FROM sales_orders WHERE id = :id"), {"id": so_id}).first()
     if not row:
         raise HTTPException(404, "Sales order not found")
-    
+    if body.payment_status == 2 and body.payment_amount is not None:
+        if body.payment_amount > float(row.total_amount):
+            raise HTTPException(400, f"Payment amount cannot exceed the order total of ₹{float(row.total_amount):.2f}.")
+    # Clear amount when moving away from Partial
+    amt = body.payment_amount if body.payment_status == 2 else None
     db.execute(
-        text("UPDATE sales_orders SET payment_received = :val WHERE id = :id"),
-        {"val": body.payment_received, "id": so_id}
+        text("UPDATE sales_orders SET status = :st, payment_amount = :amt, updated_at = now() WHERE id = :id"),
+        {"st": body.payment_status, "amt": amt, "id": so_id}
+    )
+    db.commit()
+    return _serialize_so(db, so_id)
+
+
+class AdditionalCostItem(BaseModel):
+    label: str = Field(min_length=1)
+    amount: float = Field(ge=0)
+
+class AdditionalCostsBody(BaseModel):
+    items: List[AdditionalCostItem] = Field(default_factory=list)
+
+@router.patch("/{so_id}/additional-costs")
+def update_additional_costs(so_id: int, body: AdditionalCostsBody, db: Session = Depends(get_db), user: dict = Depends(get_current_user)):
+    _ = user
+    row = db.execute(
+        text("SELECT gst_rate FROM sales_orders WHERE id = :id"), {"id": so_id}
+    ).first()
+    if not row:
+        raise HTTPException(404, "Sales order not found")
+    subtotal = db.execute(
+        text("SELECT COALESCE(SUM(total_price), 0) FROM sales_order_items WHERE sales_order_id = :id"),
+        {"id": so_id},
+    ).scalar()
+    subtotal = float(subtotal or 0)
+    extra = sum(float(i.amount) for i in body.items)
+    gst_base = subtotal + extra
+    gst_amt = gst_base * (float(row.gst_rate) / 100.0)
+    new_total = gst_base + gst_amt
+    items_json = json.dumps([{"label": i.label, "amount": i.amount} for i in body.items])
+    db.execute(
+        text("UPDATE sales_orders SET additional_costs = CAST(:ac AS jsonb), total_amount = :total, updated_at = now() WHERE id = :id"),
+        {"ac": items_json, "total": new_total, "id": so_id},
     )
     db.commit()
     return _serialize_so(db, so_id)

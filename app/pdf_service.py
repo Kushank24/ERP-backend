@@ -60,15 +60,18 @@ class PDFGenerationService:
             topMargin=24,
             bottomMargin=24,
         )
+        shop_floor = data.get("Variant") == "shop-floor"
         elements: list = []
         self._add_combined_header(elements, data)
-        title = Paragraph("<b>PURCHASE ORDER</b>", self.title_style)
+        title_text = "<b>SHOP FLOOR PURCHASE ORDER</b>" if shop_floor else "<b>PURCHASE ORDER</b>"
+        title = Paragraph(title_text, self.title_style)
         title.hAlign = "CENTER"
         elements.append(title)
         elements.append(Spacer(1, 8))
         self._add_vendor_details(elements, data)
-        self._add_materials_table(elements, data)
-        self._add_comments_section(elements, data)
+        self._add_materials_table(elements, data, shop_floor=shop_floor)
+        if not shop_floor:
+            self._add_comments_section(elements, data)
         self._add_signature_line(elements)
         pdf.build(elements)
         buffer.seek(0)
@@ -183,7 +186,7 @@ class PDFGenerationService:
         elements.append(combined)
         elements.append(Spacer(1, 8))
 
-    def _add_materials_table(self, elements: list, data: dict[str, Any]) -> None:
+    def _add_materials_table(self, elements: list, data: dict[str, Any], shop_floor: bool = False) -> None:
         materials = data.get("Materials", [])
         if not materials:
             elements.append(Paragraph("No materials specified", self.normal_style))
@@ -191,6 +194,47 @@ class PDFGenerationService:
 
         elements.append(Paragraph("<b>Materials</b>", self.header_style))
         elements.append(Spacer(1, 6))
+
+        if shop_floor:
+            rows = [[
+                Paragraph("<b>ITEM #</b>", self.header_style),
+                Paragraph("<b>DESCRIPTION</b>", self.header_style),
+                Paragraph("<b>LENGTH/WEIGHT/NOS</b>", self.header_style),
+                Paragraph("<b>UNIT</b>", self.header_style),
+            ]]
+            for i, mat in enumerate(materials, start=1):
+                qty = float(mat.get("length_weight_nos", 0))
+                comment = mat.get("comment", "")
+                name = mat.get("name", "")
+                desc_text = (
+                    f"{name}<br/><font size=8 color='grey'><i>Note: {comment}</i></font>"
+                    if comment else name
+                )
+                rows.append([
+                    str(i),
+                    Paragraph(desc_text, self.normal_style),
+                    str(qty) if qty > 0 else "N/A",
+                    mat.get("unit", "Nos"),
+                ])
+            n = len(materials)
+            tbl = Table(rows, colWidths=[40, 290, 130, 60])
+            tbl.setStyle(TableStyle([
+                ("GRID", (0, 0), (-1, -1), 1, colors.black),
+                ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+                ("FONTSIZE", (0, 0), (-1, -1), 9),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
+                ("TOPPADDING", (0, 0), (-1, -1), 5),
+                ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+                ("BACKGROUND", (0, 0), (-1, 0), colors.white),
+                ("ALIGN", (0, 0), (-1, 0), "CENTER"),
+                ("BACKGROUND", (0, 1), (-1, n), colors.white),
+                ("ALIGN", (0, 1), (0, n), "CENTER"),
+                ("ALIGN", (1, 1), (1, n), "LEFT"),
+                ("ALIGN", (2, 1), (-1, n), "CENTER"),
+            ]))
+            elements.append(tbl)
+            elements.append(Spacer(1, 8))
+            return
 
         rows = [
             [
@@ -226,23 +270,30 @@ class PDFGenerationService:
             float(m.get("length_weight_nos", 0)) * float(m.get("per_unit_cost", 0))
             for m in materials
         )
+        extra_costs = data.get("AdditionalCosts") or []
+        extra_total = sum(float(ec.get("amount", 0)) for ec in extra_costs)
+
         gst_pct = float(data.get("PurchaseGST", 18))
         if gst_pct > 1:
             gst_pct /= 100
-        gst_amt = subtotal * gst_pct
-        total = subtotal + gst_amt
+        gst_base = subtotal + extra_total
+        gst_amt = gst_base * gst_pct
+        total = gst_base + gst_amt
 
         n = len(materials)
         subtotal_row = n + 1
-        gst_row = n + 2
-        total_row = n + 3
+        extra_row_start = n + 2
+        gst_row = n + 2 + len(extra_costs)
+        total_row = n + 3 + len(extra_costs)
 
         rows.append(["SUBTOTAL", "", "", "", "", f"Rs.{subtotal:.2f}"])
+        for ec in extra_costs:
+            rows.append([ec.get("label", "Extra Cost"), "", "", "", "", f"Rs.{float(ec.get('amount', 0)):.2f}"])
         rows.append([f"GST ({int(gst_pct * 100)}%)", "", "", "", "", f"Rs.{gst_amt:.2f}"])
         rows.append(["TOTAL", "", "", "", "", f"Rs.{total:.2f}"])
 
         tbl = Table(rows, colWidths=[40, 200, 80, 60, 70, 70])
-        tbl.setStyle(TableStyle([
+        styles = [
             ("GRID", (0, 0), (-1, -1), 1, colors.black),
             ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
             ("FONTSIZE", (0, 0), (-1, -1), 9),
@@ -264,7 +315,10 @@ class PDFGenerationService:
             ("ALIGN", (5, subtotal_row), (5, total_row), "CENTER"),
             ("BACKGROUND", (0, total_row), (-1, total_row), colors.lightgrey),
             ("LINEABOVE", (0, total_row), (-1, total_row), 2, colors.black),
-        ]))
+        ]
+        for i in range(len(extra_costs)):
+            styles.append(("SPAN", (0, extra_row_start + i), (4, extra_row_start + i)))
+        tbl.setStyle(TableStyle(styles))
         elements.append(tbl)
         elements.append(Spacer(1, 8))
 
@@ -413,23 +467,26 @@ class PDFGenerationService:
         elements.append(Spacer(1, 20))
 
         # Material requirements
-        materials = data.get("materials", {})
+        materials = data.get("materials", [])
         if not materials:
             return
 
         elements.append(Paragraph("<b>Material Requirements</b>", self.header_style))
         elements.append(Spacer(1, 12))
 
-        mat_rows = [["MATERIAL", "UNIT", "QTY PER UNIT", "TOTAL REQUIRED"]]
-        for mat_key, info in materials.items():
+        mat_rows = [["MATERIAL", "SECTION SIZE", "UNIT", "QTY PER UNIT", "TOTAL REQUIRED"]]
+        for mat in materials:
+            ss = mat.get("section_size", 0) or 0
+            ss_display = str(int(ss)) if ss > 0 and ss == int(ss) else (str(ss) if ss > 0 else "-")
             mat_rows.append([
-                mat_key,
-                info.get("unit", "Nos"),
-                str(info.get("quantity_per_unit", 0)),
-                str(info.get("total_required", 0)),
+                Paragraph(mat.get("name", ""), self.normal_style),
+                ss_display,
+                mat.get("unit", "Nos"),
+                str(mat.get("quantity_per_unit", 0)),
+                str(mat.get("total_required", 0)),
             ])
 
-        mat_tbl = Table(mat_rows, colWidths=[150, 80, 120, 120])
+        mat_tbl = Table(mat_rows, colWidths=[200, 60, 55, 110, 110])
         mat_tbl.setStyle(TableStyle([
             ("BACKGROUND", (0, 0), (-1, 0), colors.grey),
             ("TEXTCOLOR", (0, 0), (-1, 0), colors.whitesmoke),
@@ -439,7 +496,7 @@ class PDFGenerationService:
             ("BOTTOMPADDING", (0, 0), (-1, 0), 12),
             ("BACKGROUND", (0, 1), (-1, -1), colors.beige),
             ("GRID", (0, 0), (-1, -1), 1, colors.black),
-            ("ALIGN", (2, 1), (-1, -1), "RIGHT"),
+            ("ALIGN", (3, 1), (-1, -1), "RIGHT"),
         ]))
         elements.append(mat_tbl)
         elements.append(Spacer(1, 12))

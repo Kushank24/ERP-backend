@@ -20,8 +20,8 @@ class FinishedGoodCreate(BaseModel):
     product_category: Optional[str] = None
     quantity_in_stock: float = Field(ge=0)
     work_order_id: Optional[int] = None
-    work_order_number: str = Field(min_length=1)
-    party_name: str = Field(min_length=1)
+    work_order_number: Optional[str] = None
+    party_name: Optional[str] = None
     completion_date: date
     production_cost: float = Field(default=0, ge=0)
     notes: Optional[str] = None

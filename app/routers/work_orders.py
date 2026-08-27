@@ -25,12 +25,24 @@ class WoProductIn(BaseModel):
 
 class WorkOrderCreate(BaseModel):
     work_order_number: str = Field(min_length=1)
-    po_number: str = Field(min_length=1)
-    po_date: date
-    party_name: str = Field(min_length=1)
+    po_number: Optional[str] = None
+    po_date: Optional[date] = None
+    party_name: Optional[str] = None
     creation_date: Optional[date] = None
     delivery_date: Optional[date] = None
     status: str = Field(default="in-progress")
+    remarks: Optional[str] = None
+    products: List[WoProductIn] = []
+
+
+class WorkOrderUpdate(BaseModel):
+    work_order_number: str = Field(min_length=1)
+    po_number: Optional[str] = None
+    po_date: Optional[date] = None
+    party_name: Optional[str] = None
+    creation_date: Optional[date] = None
+    delivery_date: Optional[date] = None
+    remarks: Optional[str] = None
     products: List[WoProductIn] = []
 
 
@@ -39,7 +51,7 @@ def _load_wo(db: Session, wo_id: int) -> dict:
         text(
             """
             SELECT id, work_order_number, po_number, po_date, party_name, creation_date, delivery_date, status,
-                   created_at, updated_at
+                   remarks, created_at, updated_at
             FROM work_orders WHERE id = :id
             """
         ),
@@ -50,17 +62,58 @@ def _load_wo(db: Session, wo_id: int) -> dict:
     prows = db.execute(
         text(
             """
-            SELECT w.product_id, w.quantity, p.name AS product_name
+            SELECT w.product_id, w.quantity, p.name AS product_name,
+                   COALESCE(SUM(i.quantity_issued), 0) AS issued_qty
             FROM work_order_products w
             JOIN products p ON p.id = w.product_id
+            LEFT JOIN work_order_product_issues i
+                ON i.work_order_id = w.work_order_id AND i.product_id = w.product_id
             WHERE w.work_order_id = :id
+            GROUP BY w.product_id, w.quantity, p.name
             """
         ),
         {"id": wo_id},
     ).mappings().all()
     d = dict(head)
-    d["products"] = [dict(x) for x in prows]
+    products = []
+    for x in prows:
+        row = dict(x)
+        row["issued_qty"] = float(row["issued_qty"])
+        row["remaining_qty"] = max(0.0, float(row["quantity"]) - row["issued_qty"])
+        products.append(row)
+    d["products"] = products
     return d
+
+
+def _compute_materials(db: Session, products: list) -> list:
+    mats_dict: dict = {}
+    for p in products:
+        boq_lines = db.execute(
+            text(
+                """
+                SELECT b.name, b.section_size, b.units, b.quantity AS qty_per_unit, b.total_quantity_consumed
+                FROM bill_of_quantities b
+                JOIN product_bill_of_quantity_relations r ON r.bill_of_quantity_id = b.id
+                WHERE r.product_id = :pid
+                """
+            ),
+            {"pid": p["product_id"]},
+        ).mappings().all()
+        for b in boq_lines:
+            ss = float(b["section_size"] or 0)
+            key = (b["name"], ss)
+            total = float(b["total_quantity_consumed"]) * float(p["quantity"])
+            if key in mats_dict:
+                mats_dict[key]["total_required"] = round(mats_dict[key]["total_required"] + total, 4)
+            else:
+                mats_dict[key] = {
+                    "name": b["name"],
+                    "section_size": ss,
+                    "unit": b["units"],
+                    "quantity_per_unit": round(float(b["qty_per_unit"]), 4),
+                    "total_required": round(total, 4),
+                }
+    return list(mats_dict.values())
 
 
 @router.get("")
@@ -81,6 +134,12 @@ def list_wos(db: Session = Depends(get_db), user: dict = Depends(get_current_use
 def get_wo(wo_id: int, db: Session = Depends(get_db), user: dict = Depends(get_current_user)):
     _ = user
     return _load_wo(db, wo_id)
+
+@router.get("/{wo_id}/materials")
+def get_wo_materials(wo_id: int, db: Session = Depends(get_db), user: dict = Depends(get_current_user)):
+    _ = user
+    wo = _load_wo(db, wo_id)
+    return _compute_materials(db, wo["products"])
 
 @router.get("/parties/list")
 def list_parties(db: Session = Depends(get_db), user: dict = Depends(get_current_user)):
@@ -110,20 +169,21 @@ def create_wo(
         text(
             """
             INSERT INTO work_orders (
-              work_order_number, po_number, po_date, party_name, creation_date, delivery_date, status
+              work_order_number, po_number, po_date, party_name, creation_date, delivery_date, status, remarks
             )
-            VALUES (:won, :pon, :pod, :party, :cd, :dd, :st)
+            VALUES (:won, :pon, :pod, :party, :cd, :dd, :st, :remarks)
             RETURNING id
             """
         ),
         {
             "won": body.work_order_number.strip(),
-            "pon": body.po_number.strip(),
+            "pon": (body.po_number or "").strip() or None,
             "pod": body.po_date,
-            "party": body.party_name.strip(),
+            "party": (body.party_name or "").strip() or None,
             "cd": cre,
             "dd": body.delivery_date,
             "st": body.status,
+            "remarks": body.remarks,
         },
     ).first()
     wid = row[0]
@@ -150,6 +210,73 @@ def create_wo(
 
     db.commit()
     return _load_wo(db, wid)
+
+
+@router.patch("/{wo_id}")
+def update_wo(
+    wo_id: int,
+    body: WorkOrderUpdate,
+    db: Session = Depends(get_db),
+    user: dict = Depends(get_current_user),
+):
+    _ = user
+    current = db.execute(
+        text("SELECT id, status FROM work_orders WHERE id = :id"), {"wo_id": wo_id, "id": wo_id}
+    ).mappings().first()
+    if not current:
+        raise HTTPException(404, "Work order not found")
+
+    if current["status"] == "completed" and body.products:
+        # Only block product changes on completed WOs; header/remarks are fine
+        existing_products = db.execute(
+            text("SELECT product_id, quantity FROM work_order_products WHERE work_order_id = :id"),
+            {"id": wo_id},
+        ).mappings().all()
+        existing_set = {(r["product_id"], float(r["quantity"])) for r in existing_products}
+        new_set = {(p.product_id, float(p.quantity)) for p in body.products}
+        if existing_set != new_set:
+            raise HTTPException(
+                400,
+                "Cannot change products on a completed work order — inventory has already been updated.",
+            )
+
+    db.execute(
+        text(
+            "UPDATE work_orders SET work_order_number=:won, po_number=:pon, po_date=:pod, "
+            "party_name=:party, creation_date=:cd, delivery_date=:dd, remarks=:remarks, updated_at=now() "
+            "WHERE id=:id"
+        ),
+        {
+            "won": body.work_order_number.strip(),
+            "pon": (body.po_number or "").strip() or None,
+            "pod": body.po_date,
+            "party": (body.party_name or "").strip() or None,
+            "cd": body.creation_date,
+            "dd": body.delivery_date,
+            "remarks": body.remarks,
+            "id": wo_id,
+        },
+    )
+
+    if current["status"] != "completed":
+        db.execute(text("DELETE FROM work_order_products WHERE work_order_id = :id"), {"id": wo_id})
+        seen: set[int] = set()
+        for p in body.products:
+            if p.product_id in seen:
+                db.rollback()
+                raise HTTPException(400, "Duplicate product in work order")
+            seen.add(p.product_id)
+            pr = db.execute(text("SELECT id FROM products WHERE id = :id"), {"id": p.product_id}).first()
+            if not pr:
+                db.rollback()
+                raise HTTPException(400, f"Product {p.product_id} not found")
+            db.execute(
+                text("INSERT INTO work_order_products (work_order_id, product_id, quantity) VALUES (:wid, :pid, :qty)"),
+                {"wid": wo_id, "pid": p.product_id, "qty": p.quantity},
+            )
+
+    db.commit()
+    return _load_wo(db, wo_id)
 
 
 class StatusBody(BaseModel):
@@ -231,6 +358,111 @@ def patch_status(
     return _load_wo(db, wo_id)
 
 
+class ProductIssueItem(BaseModel):
+    product_id: int
+    product_name: str = Field(min_length=1)
+    quantity: float = Field(gt=0)
+    notes: Optional[str] = None
+
+
+class ProductIssueBody(BaseModel):
+    items: List[ProductIssueItem] = Field(min_length=1)
+
+
+@router.post("/{wo_id}/issue-products", status_code=201)
+def issue_products(
+    wo_id: int,
+    body: ProductIssueBody,
+    db: Session = Depends(get_db),
+    user: dict = Depends(get_current_user),
+):
+    _ = user
+    wo_row = db.execute(
+        text("SELECT id, work_order_number, party_name FROM work_orders WHERE id = :id FOR UPDATE"),
+        {"id": wo_id},
+    ).mappings().first()
+    if not wo_row:
+        raise HTTPException(404, "Work order not found")
+
+    # Current issued quantities per product
+    wp_rows = {
+        r["product_id"]: dict(r)
+        for r in db.execute(
+            text(
+                """
+                SELECT w.product_id, w.quantity,
+                       COALESCE(SUM(i.quantity_issued), 0) AS issued_qty
+                FROM work_order_products w
+                LEFT JOIN work_order_product_issues i
+                    ON i.work_order_id = w.work_order_id AND i.product_id = w.product_id
+                WHERE w.work_order_id = :id
+                GROUP BY w.product_id, w.quantity
+                """
+            ),
+            {"id": wo_id},
+        ).mappings().all()
+    }
+
+    for item in body.items:
+        if item.product_id not in wp_rows:
+            raise HTTPException(400, f"Product id {item.product_id} is not part of this work order.")
+        prod = wp_rows[item.product_id]
+        remaining = float(prod["quantity"]) - float(prod["issued_qty"])
+        if item.quantity > remaining + 1e-9:
+            raise HTTPException(
+                400,
+                f"Cannot issue {item.quantity} of '{item.product_name}' — only {remaining:.4g} remaining.",
+            )
+
+        db.execute(
+            text(
+                """
+                INSERT INTO work_order_product_issues
+                    (work_order_id, product_id, product_name, quantity_issued, notes)
+                VALUES (:wid, :pid, :pname, :qty, :notes)
+                """
+            ),
+            {
+                "wid": wo_id,
+                "pid": item.product_id,
+                "pname": item.product_name,
+                "qty": item.quantity,
+                "notes": item.notes,
+            },
+        )
+
+        p_info = db.execute(
+            text("SELECT name, product_code, category FROM products WHERE id = :pid"),
+            {"pid": item.product_id},
+        ).mappings().first()
+
+        if p_info:
+            db.execute(
+                text(
+                    """
+                    INSERT INTO finished_goods (
+                        product_name, product_code, product_category, quantity_in_stock,
+                        work_order_id, work_order_number, party_name, completion_date
+                    ) VALUES (
+                        :pname, :pcode, :pcat, :qty, :woid, :wonum, :party, CURRENT_DATE
+                    )
+                    """
+                ),
+                {
+                    "pname": p_info["name"],
+                    "pcode": p_info["product_code"],
+                    "pcat": p_info["category"],
+                    "qty": item.quantity,
+                    "woid": wo_id,
+                    "wonum": wo_row["work_order_number"],
+                    "party": wo_row["party_name"],
+                },
+            )
+
+    db.commit()
+    return _load_wo(db, wo_id)
+
+
 @router.get("/{wo_id}/pdf")
 def download_wo_pdf(
     wo_id: int,
@@ -239,36 +471,6 @@ def download_wo_pdf(
 ):
     _ = user
     wo = _load_wo(db, wo_id)
-
-    # Compute material requirements from each product's BOQ lines.
-    materials: dict = {}
-    for p in wo["products"]:
-        boq_lines = db.execute(
-            text(
-                """
-                SELECT b.name, b.units, b.quantity AS qty_per_unit, b.total_quantity_consumed
-                FROM bill_of_quantities b
-                JOIN product_bill_of_quantity_relations r ON r.bill_of_quantity_id = b.id
-                WHERE r.product_id = :pid
-                """
-            ),
-            {"pid": p["product_id"]},
-        ).mappings().all()
-
-        for b in boq_lines:
-            key = b["name"]
-            qty_per = float(b["qty_per_unit"])
-            total = float(b["total_quantity_consumed"]) * float(p["quantity"])
-            if key in materials:
-                materials[key]["total_required"] = round(
-                    materials[key]["total_required"] + total, 4
-                )
-            else:
-                materials[key] = {
-                    "unit": b["units"],
-                    "quantity_per_unit": round(qty_per, 4),
-                    "total_required": round(total, 4),
-                }
 
     pdf_data = {
         "work_order_number": wo["work_order_number"],
@@ -284,7 +486,7 @@ def download_wo_pdf(
             }
             for p in wo["products"]
         ],
-        "materials": materials,
+        "materials": _compute_materials(db, wo["products"]),
     }
 
     import re

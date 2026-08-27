@@ -4,6 +4,7 @@ from __future__ import annotations
 import io
 import logging
 import os
+from xml.sax.saxutils import escape
 from typing import Any
 
 from reportlab.lib import colors
@@ -499,3 +500,327 @@ class PDFGenerationService:
         ]))
         elements.append(mat_tbl)
         elements.append(Spacer(1, 12))
+
+    # ------------------------------------------------------------------
+    # Public: Offer / Quotation PDF  (E-Safe format)
+    # ------------------------------------------------------------------
+
+    def generate_offer_pdf(self, data: dict[str, Any]) -> io.BytesIO:
+        from reportlab.lib.pagesizes import A4
+        from reportlab.lib.enums import TA_LEFT, TA_CENTER, TA_JUSTIFY
+        from datetime import date as _date
+
+        buffer = io.BytesIO()
+        pdf = SimpleDocTemplate(
+            buffer,
+            pagesize=A4,
+            leftMargin=0.5 * inch,
+            rightMargin=0.5 * inch,
+            topMargin=0.5 * inch,
+            bottomMargin=0.5 * inch,
+        )
+        elements: list = []
+
+        # ── styles ────────────────────────────────────────────────────
+        normal_st = ParagraphStyle("OfNormal", fontSize=11, fontName="Helvetica",
+                                   spaceAfter=1, alignment=TA_JUSTIFY)
+        no_space_st = ParagraphStyle("OfNoSpace", fontSize=11, fontName="Helvetica",
+                                     spaceAfter=0, alignment=TA_JUSTIFY)
+        justify_st = ParagraphStyle("OfJustify", fontSize=11, fontName="Helvetica",
+                                    spaceAfter=1, alignment=TA_JUSTIFY)
+        header_cell_st = ParagraphStyle("OfHdrCell", fontSize=9, fontName="Helvetica-Bold",
+                                        alignment=TA_CENTER)
+        desc_st = ParagraphStyle("OfItemDesc", fontSize=9, fontName="Helvetica",
+                                 leading=11, leftIndent=2, rightIndent=2, spaceAfter=2)
+
+        # ── logo + company header ─────────────────────────────────────
+        resolved = os.path.realpath(self.logo_path)
+        company_info_html = (
+            "<b>E-SAFE ENTERPRISES</b><br/>"
+            "G-176, Boranada Industrial Park, Jodhpur-342012 (RAJ.)<br/>"
+            "PHONE: +91291 2944321 MOBILE: +91 94133 24321<br/>"
+            "email: esafe@esafe.co.in VISIT US: www.esafe.co.in<br/>"
+            "<b>GSTN 08AACFE4028Q1Z5</b>"
+        )
+        ci_style = ParagraphStyle("OfCI", fontSize=10, fontName="Helvetica",
+                                  spaceAfter=4, alignment=TA_LEFT, leading=12)
+        if os.path.isfile(resolved):
+            logo_cell: Any = Image(resolved, width=2 * inch, height=0.85 * inch)
+            hdr_data = [[logo_cell, Paragraph(company_info_html, ci_style)]]
+            hdr_tbl = Table(hdr_data, colWidths=[2.5 * inch, 5 * inch])
+            hdr_tbl.setStyle(TableStyle([
+                ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                ("LEFTPADDING", (0, 0), (0, 0), 0),
+                ("RIGHTPADDING", (0, 0), (0, 0), 10),
+                ("LEFTPADDING", (1, 0), (1, 0), 10),
+                ("RIGHTPADDING", (1, 0), (1, 0), 0),
+                ("TOPPADDING", (0, 0), (-1, -1), 5),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
+            ]))
+        else:
+            ci_center = ParagraphStyle("OfCIC", fontSize=10, fontName="Helvetica",
+                                       spaceAfter=4, alignment=TA_CENTER, leading=12)
+            hdr_data = [[Paragraph(company_info_html, ci_center)]]
+            hdr_tbl = Table(hdr_data, colWidths=[7.5 * inch])
+            hdr_tbl.setStyle(TableStyle([
+                ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+                ("ALIGN", (0, 0), (-1, -1), "CENTER"),
+            ]))
+        elements.append(hdr_tbl)
+        elements.append(Spacer(1, 8))
+
+        # ── offer number / date ───────────────────────────────────────
+        offer_number = data.get("offer_number") or f"OFF-{data.get('id', 'XXX')}"
+        raw_date = data.get("offer_date")
+        if hasattr(raw_date, "strftime"):
+            offer_date_str = raw_date.strftime("%d-%m-%Y")
+        elif isinstance(raw_date, str) and raw_date:
+            try:
+                from datetime import datetime as _dt
+                offer_date_str = _dt.strptime(raw_date[:10], "%Y-%m-%d").strftime("%d-%m-%Y")
+            except ValueError:
+                offer_date_str = raw_date
+        else:
+            offer_date_str = _date.today().strftime("%d-%m-%Y")
+
+        elements.append(Paragraph(f"<b>{escape(offer_number)} Dated: {offer_date_str}</b>", normal_st))
+        elements.append(Spacer(1, 4))
+
+        # ── To, section ───────────────────────────────────────────────
+        elements.append(Paragraph("<b>To,</b>", no_space_st))
+        elements.append(Paragraph(escape(str(data.get("company_name") or "")), no_space_st))
+        address = str(data.get("company_address") or "")
+        for line in [ln.strip() for ln in address.split("\n") if ln.strip()]:
+            elements.append(Paragraph(escape(line), no_space_st))
+        elements.append(Spacer(1, 6))
+
+        # ── Reference / Kind Attn / Contact ──────────────────────────
+        offer_id = data.get("id") or "XXX"
+        year = _date.today().strftime("%Y")
+        # Use enquiry reference_number if present (matches original behaviour)
+        ref_no = (
+            str(data.get("enquiry_reference_number") or "").strip()
+            or f"ESE/QUO/{offer_id}/{year}"
+        )
+        attn = str(data.get("contact_person") or "N/A")
+        phone = str(data.get("company_phone") or "N/A")
+        email_val = str(data.get("company_email") or "N/A")
+
+        elements.append(Paragraph(f"<b>Reference No:</b> {escape(ref_no)}", no_space_st))
+        elements.append(Paragraph(f"<b>Kind Attn:</b> {escape(attn)}", no_space_st))
+        elements.append(Paragraph(
+            f"<b>Mobile No.:</b> {escape(phone)} | <b>Email id:</b> {escape(email_val)}",
+            normal_st,
+        ))
+        elements.append(Spacer(1, 6))
+
+        # ── Greeting / intro ──────────────────────────────────────────
+        elements.append(Paragraph("<b>Dear Sir,</b>", no_space_st))
+        elements.append(Paragraph(
+            "We thank you for your valued enquiry and confidence in E-Safe Range of Products.",
+            no_space_st,
+        ))
+        elements.append(Paragraph(
+            "At E-Safe \"Taking Care of Your Safety\" is more than a motto - It's our Mission. "
+            "Whether you are working at any Height, work confidently with E-Safe. From Ladders to "
+            "Fall Protection, E-Safe offer a range of Climbing and safety equipments which are "
+            "engineered to provide maximum stability, safety and comfort at every height. Our "
+            "products are designed to be used anywhere from home to the most demanding job sites.",
+            justify_st,
+        ))
+        elements.append(Spacer(1, 6))
+
+        # ── currency symbol ───────────────────────────────────────────
+        currency = str(data.get("currency") or "INR")
+        _sym_map = {
+            "INR": "Rs.", "Rs.": "Rs.", "Rs": "Rs.",
+            "USD": "$", "$": "$",
+            "EUR": "€", "€": "€",
+        }
+        sym = _sym_map.get(currency, currency)
+
+        # ── items table ───────────────────────────────────────────────
+        items = data.get("items") or []
+        rows: list = [[
+            Paragraph("SN", header_cell_st),
+            Paragraph("Item Description", header_cell_st),
+            Paragraph("Unit", header_cell_st),
+            Paragraph("Qty", header_cell_st),
+            Paragraph(f"Rate in {sym}<br/>Per PC", header_cell_st),
+            Paragraph("Total<br/>Amount", header_cell_st),
+        ]]
+
+        for i, item in enumerate(items, 1):
+            qty = int(item.get("quantity") or 1)
+            up = float(item.get("unit_price") or 0)
+            tp = float(item.get("total_price") or qty * up)
+            # Bold product name
+            desc_html = f"<b>{escape(str(item.get('description') or ''))}</b>"
+            # Definition (if stored on item)
+            definition = str(item.get("definition") or "").strip()
+            if definition:
+                desc_html += f"<br/>{escape(definition)}"
+            # Specifications with heading — same 9pt black font as original
+            specs = [s for s in (item.get("specifications") or []) if str(s.get("value") or "").strip()]
+            if specs:
+                desc_html += "<br/>Specifications:"
+                for s in specs:
+                    desc_html += (
+                        f"<br/>• {escape(str(s.get('spec_name') or ''))}: "
+                        f"{escape(str(s.get('value')))}"
+                    )
+            rows.append([
+                str(i),
+                Paragraph(desc_html, desc_st),
+                "PC",
+                str(qty),
+                f"{sym} {up:,.2f}",
+                f"{sym} {tp:,.2f}",
+            ])
+
+        # cost breakdown rows
+        subtotal = float(data.get("subtotal") or 0)
+        packing_pct = float(data.get("packing_charges_pct") or 0)
+        freight = float(data.get("freight_charges") or 0)
+        gst_pct = float(data.get("gst_pct") or 18)
+        packing_amt = subtotal * (packing_pct / 100)
+        assessable = subtotal + packing_amt + freight
+        gst_amt = assessable * (gst_pct / 100)
+        grand_total = assessable + gst_amt
+
+        breakdown_start = len(rows)
+        rows.append(["", "Sub-Total", "", "", "", f"{sym} {subtotal:,.2f}"])
+        if packing_pct > 0:
+            rows.append(["", f"Packing Charges ({packing_pct:.0f}%)", "", "", "", f"{sym} {packing_amt:,.2f}"])
+        if freight > 0:
+            rows.append(["", "Freight Charges", "", "", "", f"{sym} {freight:,.2f}"])
+        rows.append(["", "Assessable Value", "", "", "", f"{sym} {assessable:,.2f}"])
+        rows.append(["", f"IGST ({gst_pct:.0f}%)", "", "", "", f"{sym} {gst_amt:,.2f}"])
+        rows.append(["", "GRAND TOTAL", "", "", "", f"{sym} {grand_total:,.2f}"])
+        total_row = len(rows) - 1
+
+        col_widths = [0.5 * inch, 4.0 * inch, 0.6 * inch, 0.6 * inch, 1.0 * inch, 1.0 * inch]
+        item_tbl = Table(rows, colWidths=col_widths, repeatRows=1)
+
+        tbl_style = [
+            ("GRID", (0, 0), (-1, -1), 1, colors.darkblue),
+            ("VALIGN", (0, 0), (-1, 0), "MIDDLE"),
+            ("VALIGN", (0, 1), (-1, breakdown_start - 1), "TOP"),
+            # Header row
+            ("BACKGROUND", (0, 0), (-1, 0), colors.lightblue),
+            ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+            ("FONTSIZE", (0, 0), (-1, 0), 9),
+            ("ALIGN", (0, 0), (-1, 0), "CENTER"),
+            ("TOPPADDING", (0, 0), (-1, 0), 3),
+            ("BOTTOMPADDING", (0, 0), (-1, 0), 3),
+            # Product rows
+            ("FONTSIZE", (0, 1), (-1, breakdown_start - 1), 9),
+            ("ALIGN", (0, 1), (0, breakdown_start - 1), "CENTER"),   # SN
+            ("ALIGN", (1, 1), (1, breakdown_start - 1), "LEFT"),      # Description
+            ("ALIGN", (2, 1), (2, breakdown_start - 1), "CENTER"),   # Unit
+            ("ALIGN", (3, 1), (3, breakdown_start - 1), "CENTER"),   # Qty
+            ("ALIGN", (4, 1), (4, breakdown_start - 1), "RIGHT"),    # Rate
+            ("ALIGN", (5, 1), (5, breakdown_start - 1), "RIGHT"),    # Total
+            ("TOPPADDING", (0, 1), (-1, breakdown_start - 1), 2),
+            ("BOTTOMPADDING", (0, 1), (-1, breakdown_start - 1), 2),
+            # Breakdown rows
+            ("FONTSIZE", (0, breakdown_start), (-1, -1), 9),
+            ("FONTNAME", (1, breakdown_start), (1, -1), "Helvetica-Bold"),
+            ("ALIGN", (1, breakdown_start), (1, -1), "CENTER"),
+            ("ALIGN", (5, breakdown_start), (5, -1), "RIGHT"),
+            ("TOPPADDING", (0, breakdown_start), (-1, -1), 2),
+            ("BOTTOMPADDING", (0, breakdown_start), (-1, -1), 2),
+            # Grand Total row
+            ("BACKGROUND", (0, total_row), (-1, total_row), colors.darkblue),
+            ("TEXTCOLOR", (0, total_row), (-1, total_row), colors.white),
+            ("FONTNAME", (0, total_row), (-1, total_row), "Helvetica-Bold"),
+            ("FONTSIZE", (0, total_row), (-1, total_row), 10),
+        ]
+        for r in range(breakdown_start, len(rows)):
+            tbl_style.append(("SPAN", (1, r), (4, r)))
+
+        item_tbl.setStyle(TableStyle(tbl_style))
+        elements.append(item_tbl)
+        elements.append(Spacer(1, 8))
+
+        # ── Terms & Conditions ────────────────────────────────────────
+        tc = (data.get("terms_conditions") or "").strip()
+        terms_rows: list = [["Terms & Conditions", ""]]
+        if tc:
+            for line in tc.split("\n"):
+                if ":" in line:
+                    key, val = line.split(":", 1)
+                    key, val = key.strip(), val.strip()
+                    if key == "Currency":
+                        continue
+                    if key == "Freight Charges":
+                        try:
+                            if float(val.replace("Rs. ", "").replace("$ ", "").replace(",", "")) == 0:
+                                continue
+                        except (ValueError, TypeError):
+                            pass
+                    if key == "GST Extra":
+                        try:
+                            if float(val.replace("%", "").strip()) == 0:
+                                val = "Inclusive"
+                        except (ValueError, TypeError):
+                            pass
+                    terms_rows.append([key, val])
+        else:
+            terms_rows += [
+                ["Rates Quoted above are", "Ex-works / FOR Destination"],
+                ["Packing Charges", "3% Extra / Nil"],
+                ["GST Extra", "18%"],
+                ["Transportation", "Extra to be paid by Buyer"],
+                ["Delivery", str(data.get("valid_until") or "As per mutual agreement")],
+                ["Payment", "As per mutual agreement"],
+                ["Manufactured by and Brand", "E-SAFE"],
+                ["Our GST No.", "08AACFE4028Q1Z5"],
+            ]
+
+        terms_label_st = ParagraphStyle("TL", fontSize=9, fontName="Helvetica-Bold", alignment=TA_LEFT)
+        terms_val_st = ParagraphStyle("TV", fontSize=9, fontName="Helvetica", alignment=TA_LEFT)
+        proc_terms: list = []
+        for idx, row in enumerate(terms_rows):
+            if idx == 0:
+                proc_terms.append(row)
+            else:
+                proc_terms.append([
+                    Paragraph(escape(str(row[0])), terms_label_st),
+                    Paragraph(escape(str(row[1])), terms_val_st),
+                ])
+
+        terms_tbl = Table(proc_terms, colWidths=[2.8 * inch, 3.5 * inch])
+        alt_rows = len(proc_terms)
+        t_style = [
+            ("BACKGROUND", (0, 0), (-1, 0), colors.lightblue),
+            ("ALIGN", (0, 0), (-1, 0), "CENTER"),
+            ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+            ("FONTSIZE", (0, 0), (-1, 0), 12),
+            ("SPAN", (0, 0), (-1, 0)),
+            ("TOPPADDING", (0, 0), (-1, 0), 8),
+            ("BOTTOMPADDING", (0, 0), (-1, 0), 12),
+            ("GRID", (0, 0), (-1, -1), 1, colors.darkblue),
+            ("VALIGN", (0, 1), (-1, -1), "TOP"),
+            ("LEFTPADDING", (0, 0), (-1, -1), 6),
+            ("RIGHTPADDING", (0, 0), (-1, -1), 6),
+            ("TOPPADDING", (0, 1), (-1, -1), 3),
+            ("BOTTOMPADDING", (0, 1), (-1, -1), 3),
+        ]
+        for r in range(2, alt_rows, 2):
+            t_style.append(("BACKGROUND", (0, r), (-1, r), colors.lightgrey))
+        terms_tbl.setStyle(TableStyle(t_style))
+        elements.append(terms_tbl)
+        elements.append(Spacer(1, 8))
+
+        # ── Closing ───────────────────────────────────────────────────
+        elements.append(Paragraph("Thanking you,", normal_st))
+        elements.append(Spacer(1, 8))
+        elements.append(Paragraph("For E-Safe Enterprises", normal_st))
+        elements.append(Spacer(1, 8))
+        elements.append(Paragraph("Authorized Signatory", normal_st))
+
+        pdf.build(elements)
+        buffer.seek(0)
+        logger.info("Generated offer PDF: %s", data.get("offer_number"))
+        return buffer

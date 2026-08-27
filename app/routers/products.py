@@ -41,6 +41,14 @@ class ProductPatch(BaseModel):
     default_unit_price: Optional[float] = Field(default=None, ge=0)
 
 
+class SpecificationCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=100)
+
+
+class ProductSpecsUpdate(BaseModel):
+    specification_ids: List[int] = Field(default_factory=list)
+
+
 class BoqLineAdd(BaseModel):
     name: str = Field(min_length=1)
     section_size: float = Field(ge=0)
@@ -101,6 +109,7 @@ def list_categories(db: Session = Depends(get_db), user: dict = Depends(get_curr
 def list_products(
     search: Optional[str] = Query(default=None),
     category: Optional[str] = Query(default=None),
+    has_specs: bool = Query(default=False),
     page: int = Query(default=1, ge=1),
     page_size: int = Query(default=100, ge=1, le=500),
     db: Session = Depends(get_db),
@@ -122,6 +131,9 @@ def list_products(
         else:
             conditions.append("p.category = :category")
             params["category"] = category
+
+    if has_specs:
+        conditions.append("EXISTS (SELECT 1 FROM product_specifications ps WHERE ps.product_id = p.id)")
 
     where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
 
@@ -156,6 +168,90 @@ def list_products(
         "page": page,
         "page_size": page_size,
     }
+
+
+@router.get("/specifications/catalog")
+def list_all_specifications(
+    db: Session = Depends(get_db),
+    _user: dict = Depends(get_current_user),
+):
+    rows = db.execute(
+        text("""
+            SELECT s.id, s.name, COUNT(ps.product_id)::int AS product_count
+            FROM specifications s
+            LEFT JOIN product_specifications ps ON ps.specification_id = s.id
+            GROUP BY s.id, s.name
+            ORDER BY s.name
+        """)
+    ).mappings().all()
+    return [dict(r) for r in rows]
+
+
+@router.post("/specifications/catalog", status_code=201)
+def create_specification(
+    body: SpecificationCreate,
+    db: Session = Depends(get_db),
+    _user: dict = Depends(get_current_user),
+):
+    name = body.name.strip()
+    row = db.execute(
+        text("""
+            INSERT INTO specifications (name) VALUES (:name)
+            ON CONFLICT (name) DO NOTHING
+            RETURNING id, name
+        """),
+        {"name": name},
+    ).mappings().first()
+    if not row:
+        raise HTTPException(400, f'Specification "{name}" already exists')
+    db.commit()
+    return {**dict(row), "product_count": 0}
+
+
+@router.get("/{product_id}/specifications")
+def get_product_specifications(
+    product_id: int,
+    db: Session = Depends(get_db),
+    _user: dict = Depends(get_current_user),
+):
+    rows = db.execute(
+        text("""
+            SELECT ps.id, ps.specification_id, s.name AS spec_name, ps.display_order
+            FROM product_specifications ps
+            JOIN specifications s ON s.id = ps.specification_id
+            WHERE ps.product_id = :pid
+            ORDER BY ps.display_order ASC, s.name ASC
+        """),
+        {"pid": product_id},
+    ).mappings().all()
+    return [dict(r) for r in rows]
+
+
+@router.put("/{product_id}/specifications")
+def set_product_specifications(
+    product_id: int,
+    body: ProductSpecsUpdate,
+    db: Session = Depends(get_db),
+    _user: dict = Depends(get_current_user),
+):
+    exists = db.execute(text("SELECT 1 FROM products WHERE id = :id"), {"id": product_id}).first()
+    if not exists:
+        raise HTTPException(404, "Product not found")
+
+    db.execute(
+        text("DELETE FROM product_specifications WHERE product_id = :pid"),
+        {"pid": product_id},
+    )
+    for order, spec_id in enumerate(dict.fromkeys(body.specification_ids)):
+        db.execute(
+            text("""
+                INSERT INTO product_specifications (product_id, specification_id, display_order)
+                VALUES (:pid, :sid, :ord)
+            """),
+            {"pid": product_id, "sid": spec_id, "ord": order},
+        )
+    db.commit()
+    return get_product_specifications(product_id, db, _user)
 
 
 @router.get("/{product_id}")

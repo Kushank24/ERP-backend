@@ -206,7 +206,7 @@ def create_offer(
     # If linked to an enquiry, mark it as offer_sent
     if body.enquiry_id:
         db.execute(
-            text("UPDATE enquiries SET status = 'offer_sent', updated_at = NOW() WHERE id = :id"),
+            text("UPDATE enquiries SET status = 'offer_sent' WHERE id = :id"),
             {"id": body.enquiry_id},
         )
 
@@ -244,7 +244,7 @@ def update_offer(
                 valid_until = :valid_until, currency = :currency,
                 packing_charges_pct = :packing_charges_pct, freight_charges = :freight_charges,
                 gst_pct = :gst_pct, subtotal = :subtotal, total_amount = :total_amount,
-                terms_conditions = :terms_conditions, notes = :notes, updated_at = NOW()
+                terms_conditions = :terms_conditions, notes = :notes
             WHERE id = :id
         """),
         {
@@ -288,7 +288,7 @@ def update_status(
     db.execute(
         text("""
             UPDATE offers
-            SET status = :status, follow_up_comments = :comments, updated_at = NOW()
+            SET status = :status, follow_up_comments = :comments
             WHERE id = :id
         """),
         {"id": offer_id, "status": body.status, "comments": body.follow_up_comments},
@@ -344,7 +344,7 @@ def update_status(
         # Mark linked enquiry as completed
         if offer.get("enquiry_id"):
             db.execute(
-                text("UPDATE enquiries SET status = 'completed', updated_at = NOW() WHERE id = :id"),
+                text("UPDATE enquiries SET status = 'completed' WHERE id = :id"),
                 {"id": offer["enquiry_id"]},
             )
 

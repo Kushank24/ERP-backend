@@ -94,8 +94,7 @@ def update_company(
         text("""
             UPDATE companies
             SET name = :name, contact_person = :contact_person, email = :email,
-                phone = :phone, address = :address, gstin = :gstin,
-                updated_at = NOW()
+                phone = :phone, address = :address, gstin = :gstin
             WHERE id = :id
         """),
         {**body.model_dump(), "id": company_id},

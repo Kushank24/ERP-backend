@@ -201,8 +201,7 @@ def update_enquiry(
             UPDATE enquiries
             SET company_id = :company_id, enquiry_date = :enquiry_date,
                 status = :status, priority = :priority,
-                notes = :notes, reference_number = :reference_number,
-                updated_at = NOW()
+                notes = :notes, reference_number = :reference_number
             WHERE id = :id
         """),
         {

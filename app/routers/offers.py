@@ -66,6 +66,15 @@ def _calc_totals(items: list, packing_pct: float, freight: float, gst_pct: float
     return {"subtotal": subtotal, "total_amount": total}
 
 
+def _get_status(db: Session, offer_id: int) -> str:
+    row = db.execute(
+        text("SELECT status FROM offers WHERE id = :id"), {"id": offer_id}
+    ).first()
+    if not row:
+        raise HTTPException(status_code=404, detail="Offer not found")
+    return row[0]
+
+
 def _serialize(db: Session, offer_id: int) -> dict:
     offer = db.execute(
         text("""
@@ -96,19 +105,27 @@ def _serialize(db: Session, offer_id: int) -> dict:
         {"id": offer_id},
     ).mappings().all()
 
-    item_list = []
-    for item in items:
-        specs = db.execute(
+    # Fetch ALL specs for ALL items in one query instead of one query per item
+    item_ids = [item["id"] for item in items]
+    specs_by_item: dict[int, list] = {iid: [] for iid in item_ids}
+    if item_ids:
+        all_specs = db.execute(
             text("""
-                SELECT ois.specification_id, ois.value, s.name AS spec_name
+                SELECT ois.offer_item_id, ois.specification_id, ois.value, s.name AS spec_name
                 FROM offer_item_specifications ois
                 JOIN specifications s ON s.id = ois.specification_id
-                WHERE ois.offer_item_id = :item_id
-                ORDER BY ois.specification_id
+                WHERE ois.offer_item_id = ANY(:ids)
+                ORDER BY ois.offer_item_id, ois.specification_id
             """),
-            {"item_id": item["id"]},
+            {"ids": item_ids},
         ).mappings().all()
-        item_list.append({**dict(item), "specifications": [dict(s) for s in specs]})
+        for row in all_specs:
+            specs_by_item[row["offer_item_id"]].append(dict(row))
+
+    item_list = [
+        {**dict(item), "specifications": specs_by_item[item["id"]]}
+        for item in items
+    ]
 
     return {**dict(offer), "items": item_list}
 
@@ -230,8 +247,7 @@ def update_offer(
     db: Session = Depends(get_db),
     _user: dict = Depends(get_current_user),
 ):
-    existing = _serialize(db, offer_id)
-    if existing["status"] == "accepted":
+    if _get_status(db, offer_id) == "accepted":
         raise HTTPException(400, "Accepted offers cannot be edited")
 
     totals = _calc_totals(body.items, body.packing_charges_pct, body.freight_charges, body.gst_pct)
@@ -281,8 +297,7 @@ def update_status(
     if body.status not in VALID_STATUSES:
         raise HTTPException(400, f"Invalid status. Choose from: {VALID_STATUSES}")
 
-    offer = _serialize(db, offer_id)
-    if offer["status"] == "accepted":
+    if _get_status(db, offer_id) == "accepted":
         raise HTTPException(400, "Accepted offers cannot be changed")
 
     db.execute(
@@ -295,7 +310,18 @@ def update_status(
     )
 
     # Auto-create Sales Order when an offer is accepted
-    if body.status == "accepted" and not offer.get("sales_order_id"):
+    if body.status == "accepted":
+        offer = db.execute(
+            text("""
+                SELECT o.*, c.name AS company_name, c.gstin AS company_gstin
+                FROM offers o
+                LEFT JOIN companies c ON c.id = o.company_id
+                WHERE o.id = :id
+            """),
+            {"id": offer_id},
+        ).mappings().first()
+
+    if body.status == "accepted" and offer and not offer.get("sales_order_id"):
         so_row = db.execute(
             text("""
                 INSERT INTO sales_orders
@@ -358,8 +384,7 @@ def delete_offer(
     db: Session = Depends(get_db),
     _user: dict = Depends(get_current_user),
 ):
-    offer = _serialize(db, offer_id)
-    if offer["status"] == "accepted":
+    if _get_status(db, offer_id) == "accepted":
         raise HTTPException(400, "Accepted offers cannot be deleted")
     db.execute(text("DELETE FROM offers WHERE id = :id"), {"id": offer_id})
     db.commit()
@@ -384,30 +409,55 @@ def download_offer_pdf(
 # ── helpers ─────────────────────────────────────────────────────────────────
 
 def _insert_items(db: Session, offer_id: int, items: list) -> None:
-    for item in items:
-        row = db.execute(
+    if not items:
+        return
+
+    # Insert ALL items in one batched query using UNNEST — 1 round-trip instead of N
+    # Use CAST(... AS type[]) instead of ::type[] to avoid SQLAlchemy text() parser
+    # choking on the double-colon token.
+    item_rows = db.execute(
+        text("""
+            INSERT INTO offer_items
+                (offer_id, product_id, description, quantity, unit_price, total_price)
+            SELECT
+                :offer_id,
+                unnest(CAST(:product_ids AS int[])),
+                unnest(CAST(:descriptions AS text[])),
+                unnest(CAST(:quantities AS int[])),
+                unnest(CAST(:unit_prices AS numeric[])),
+                unnest(CAST(:total_prices AS numeric[]))
+            RETURNING id
+        """),
+        {
+            "offer_id": offer_id,
+            "product_ids": [item.product_id for item in items],
+            "descriptions": [item.description for item in items],
+            "quantities": [item.quantity for item in items],
+            "unit_prices": [item.unit_price for item in items],
+            "total_prices": [item.quantity * item.unit_price for item in items],
+        },
+    ).all()
+
+    # Collect all specs across all items, then insert in one batched query
+    spec_item_ids: list[int] = []
+    spec_spec_ids: list[int] = []
+    spec_values: list[str] = []
+    for item, row in zip(items, item_rows):
+        for spec in (item.specifications or []):
+            if spec.value.strip():
+                spec_item_ids.append(row[0])
+                spec_spec_ids.append(spec.specification_id)
+                spec_values.append(spec.value.strip())
+
+    if spec_item_ids:
+        db.execute(
             text("""
-                INSERT INTO offer_items (offer_id, product_id, description, quantity, unit_price, total_price)
-                VALUES (:offer_id, :product_id, :description, :quantity, :unit_price, :total_price)
-                RETURNING id
+                INSERT INTO offer_item_specifications (offer_item_id, specification_id, value)
+                SELECT
+                    unnest(CAST(:item_ids AS int[])),
+                    unnest(CAST(:spec_ids AS int[])),
+                    unnest(CAST(:vals AS text[]))
+                ON CONFLICT (offer_item_id, specification_id) DO UPDATE SET value = EXCLUDED.value
             """),
-            {
-                "offer_id": offer_id,
-                "product_id": item.product_id,
-                "description": item.description,
-                "quantity": item.quantity,
-                "unit_price": item.unit_price,
-                "total_price": item.quantity * item.unit_price,
-            },
-        ).mappings().first()
-        if row and item.specifications:
-            for spec in item.specifications:
-                if spec.value.strip():
-                    db.execute(
-                        text("""
-                            INSERT INTO offer_item_specifications (offer_item_id, specification_id, value)
-                            VALUES (:item_id, :spec_id, :val)
-                            ON CONFLICT (offer_item_id, specification_id) DO UPDATE SET value = EXCLUDED.value
-                        """),
-                        {"item_id": row["id"], "spec_id": spec.specification_id, "val": spec.value.strip()},
-                    )
+            {"item_ids": spec_item_ids, "spec_ids": spec_spec_ids, "vals": spec_values},
+        )

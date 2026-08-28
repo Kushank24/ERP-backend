@@ -251,6 +251,7 @@ def create_so(
             },
         )
 
+    db.execute(text("DELETE FROM finished_goods WHERE quantity_in_stock <= 0"))
     db.commit()
     return _serialize_so(db, so_id)
 

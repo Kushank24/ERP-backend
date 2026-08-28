@@ -10,6 +10,7 @@ from sqlalchemy.exc import OperationalError, SQLAlchemyError
 from .config import settings
 from .routers import (
     auth,
+    catalog_products,
     companies,
     dashboard,
     enquiries,
@@ -146,6 +147,7 @@ app.include_router(dashboard.router, prefix="/api/v1")
 app.include_router(companies.router, prefix="/api/v1")
 app.include_router(enquiries.router, prefix="/api/v1")
 app.include_router(offers.router, prefix="/api/v1")
+app.include_router(catalog_products.router, prefix="/api/v1")
 app.include_router(materials.router, prefix="/api/v1")
 app.include_router(products.router, prefix="/api/v1")
 app.include_router(purchase_orders.router, prefix="/api/v1")

@@ -493,3 +493,13 @@ def dispatch_so(so_id: int, body: DispatchCreate, db: Session = Depends(get_db),
     db.commit()
     return _serialize_so(db, so_id)
 
+
+@router.delete("/{so_id}", status_code=204)
+def delete_so(so_id: int, db: Session = Depends(get_db), user: dict = Depends(get_current_user)):
+    _ = user
+    if not db.execute(text("SELECT id FROM sales_orders WHERE id = :id"), {"id": so_id}).first():
+        raise HTTPException(404, "Sales order not found")
+    db.execute(text("DELETE FROM sales_order_items WHERE sales_order_id = :id"), {"id": so_id})
+    db.execute(text("DELETE FROM sales_orders WHERE id = :id"), {"id": so_id})
+    db.commit()
+

@@ -682,7 +682,8 @@ class PDFGenerationService:
         subtotal = float(data.get("subtotal") or 0)
         packing_pct = float(data.get("packing_charges_pct") or 0)
         freight = float(data.get("freight_charges") or 0)
-        gst_pct = float(data.get("gst_pct") or 18)
+        _gst = data.get("gst_pct")
+        gst_pct = float(_gst if _gst is not None else 18)
         packing_amt = subtotal * (packing_pct / 100)
         assessable = subtotal + packing_amt + freight
         gst_amt = assessable * (gst_pct / 100)
@@ -694,8 +695,10 @@ class PDFGenerationService:
             rows.append(["", f"Packing Charges ({packing_pct:.0f}%)", "", "", "", f"{sym} {packing_amt:,.2f}"])
         if freight > 0:
             rows.append(["", "Freight Charges", "", "", "", f"{sym} {freight:,.2f}"])
-        rows.append(["", "Assessable Value", "", "", "", f"{sym} {assessable:,.2f}"])
-        rows.append(["", f"IGST ({gst_pct:.0f}%)", "", "", "", f"{sym} {gst_amt:,.2f}"])
+        if packing_pct > 0 or freight > 0:
+            rows.append(["", "Assessable Value", "", "", "", f"{sym} {assessable:,.2f}"])
+        if gst_pct > 0:
+            rows.append(["", f"IGST ({gst_pct:.0f}%)", "", "", "", f"{sym} {gst_amt:,.2f}"])
         rows.append(["", "GRAND TOTAL", "", "", "", f"{sym} {grand_total:,.2f}"])
         total_row = len(rows) - 1
 

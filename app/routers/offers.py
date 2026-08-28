@@ -43,6 +43,7 @@ class OfferCreate(BaseModel):
     packing_charges_pct: float = 0
     freight_charges: float = 0
     gst_pct: float = 18
+    kind_attn: Optional[str] = None
     terms_conditions: Optional[str] = None
     notes: Optional[str] = None
     items: List[OfferItemIn] = Field(default_factory=list)
@@ -80,7 +81,9 @@ def _serialize(db: Session, offer_id: int) -> dict:
         text("""
             SELECT o.*,
                    c.name AS company_name, c.gstin AS company_gstin,
-                   c.address AS company_address, c.contact_person,
+                   c.address AS company_address,
+                   c.contact_person AS company_contact_person,
+                   COALESCE(o.kind_attn, c.contact_person) AS contact_person,
                    c.phone AS company_phone, c.email AS company_email,
                    e.enquiry_number,
                    e.reference_number AS enquiry_reference_number
@@ -96,9 +99,9 @@ def _serialize(db: Session, offer_id: int) -> dict:
 
     items = db.execute(
         text("""
-            SELECT oi.*, p.name AS product_name_resolved
+            SELECT oi.*, cp.model_name AS product_name_resolved
             FROM offer_items oi
-            LEFT JOIN products p ON p.id = oi.product_id
+            LEFT JOIN catalog_products cp ON cp.id = oi.product_id
             WHERE oi.offer_id = :id
             ORDER BY oi.id
         """),
@@ -128,6 +131,30 @@ def _serialize(db: Session, offer_id: int) -> dict:
     ]
 
     return {**dict(offer), "items": item_list}
+
+
+@router.get("/price-history")
+def get_price_history(
+    company_id: int,
+    product_id: int,
+    limit: int = 5,
+    db: Session = Depends(get_db),
+    _user: dict = Depends(get_current_user),
+):
+    """Return the last N unit prices quoted to a company for a specific product."""
+    rows = db.execute(
+        text("""
+            SELECT o.offer_number, o.offer_date, o.status,
+                   oi.unit_price, oi.quantity
+            FROM offer_items oi
+            JOIN offers o ON o.id = oi.offer_id
+            WHERE o.company_id = :company_id AND oi.product_id = :product_id
+            ORDER BY o.offer_date DESC, o.id DESC
+            LIMIT :limit
+        """),
+        {"company_id": company_id, "product_id": product_id, "limit": limit},
+    ).mappings().all()
+    return [dict(r) for r in rows]
 
 
 @router.get("")
@@ -193,11 +220,11 @@ def create_offer(
             INSERT INTO offers
                 (enquiry_id, company_id, offer_number, offer_date, valid_until,
                  currency, packing_charges_pct, freight_charges, gst_pct,
-                 subtotal, total_amount, terms_conditions, notes)
+                 kind_attn, subtotal, total_amount, terms_conditions, notes)
             VALUES
                 (:enquiry_id, :company_id, :offer_number, :offer_date, :valid_until,
                  :currency, :packing_charges_pct, :freight_charges, :gst_pct,
-                 :subtotal, :total_amount, :terms_conditions, :notes)
+                 :kind_attn, :subtotal, :total_amount, :terms_conditions, :notes)
             RETURNING id
         """),
         {
@@ -210,6 +237,7 @@ def create_offer(
             "packing_charges_pct": body.packing_charges_pct,
             "freight_charges": body.freight_charges,
             "gst_pct": body.gst_pct,
+            "kind_attn": body.kind_attn or None,
             "subtotal": totals["subtotal"],
             "total_amount": totals["total_amount"],
             "terms_conditions": body.terms_conditions,
@@ -259,7 +287,8 @@ def update_offer(
                 offer_number = :offer_number, offer_date = :offer_date,
                 valid_until = :valid_until, currency = :currency,
                 packing_charges_pct = :packing_charges_pct, freight_charges = :freight_charges,
-                gst_pct = :gst_pct, subtotal = :subtotal, total_amount = :total_amount,
+                gst_pct = :gst_pct, kind_attn = :kind_attn,
+                subtotal = :subtotal, total_amount = :total_amount,
                 terms_conditions = :terms_conditions, notes = :notes
             WHERE id = :id
         """),
@@ -274,6 +303,7 @@ def update_offer(
             "packing_charges_pct": body.packing_charges_pct,
             "freight_charges": body.freight_charges,
             "gst_pct": body.gst_pct,
+            "kind_attn": body.kind_attn or None,
             "subtotal": totals["subtotal"],
             "total_amount": totals["total_amount"],
             "terms_conditions": body.terms_conditions,

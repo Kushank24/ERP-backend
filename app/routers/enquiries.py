@@ -47,10 +47,17 @@ class EnquiryUpdate(BaseModel):
 def _next_enquiry_number(db: Session) -> str:
     year = date.today().year
     row = db.execute(
-        text("SELECT COUNT(*) AS cnt FROM enquiries WHERE enquiry_number LIKE :prefix"),
-        {"prefix": f"ENQ-{year}-%"},
+        text("""
+            SELECT COALESCE(
+                MAX(CAST(SPLIT_PART(enquiry_number, '-', 3) AS INTEGER)),
+                0
+            ) AS max_seq
+            FROM enquiries
+            WHERE enquiry_number ~ :pattern
+        """),
+        {"pattern": f"^ENQ-{year}-[0-9]+$"},
     ).mappings().first()
-    seq = (row["cnt"] or 0) + 1
+    seq = (row["max_seq"] or 0) + 1
     return f"ENQ-{year}-{seq:04d}"
 
 
@@ -69,9 +76,9 @@ def _serialize(db: Session, enq_id: int) -> dict:
 
     items = db.execute(
         text("""
-            SELECT ei.*, p.name AS product_name_resolved
+            SELECT ei.*, cp.model_name AS product_name_resolved
             FROM enquiry_items ei
-            LEFT JOIN products p ON p.id = ei.product_id
+            LEFT JOIN catalog_products cp ON cp.id = ei.product_id
             WHERE ei.enquiry_id = :id
             ORDER BY ei.id
         """),
@@ -155,18 +162,22 @@ def create_enquiry(
     ).mappings().first()
     enq_id = row["id"]
 
-    for item in body.items:
+    if body.items:
         db.execute(
             text("""
                 INSERT INTO enquiry_items (enquiry_id, product_id, product_name, quantity, specifications)
-                VALUES (:enquiry_id, :product_id, :product_name, :quantity, :specifications)
+                SELECT :enq_id,
+                       unnest(CAST(:product_ids AS int[])),
+                       unnest(CAST(:product_names AS text[])),
+                       unnest(CAST(:quantities AS int[])),
+                       unnest(CAST(:specs AS text[]))
             """),
             {
-                "enquiry_id": enq_id,
-                "product_id": item.product_id,
-                "product_name": item.product_name,
-                "quantity": item.quantity,
-                "specifications": item.specifications,
+                "enq_id": enq_id,
+                "product_ids": [i.product_id for i in body.items],
+                "product_names": [i.product_name for i in body.items],
+                "quantities": [i.quantity for i in body.items],
+                "specs": [i.specifications for i in body.items],
             },
         )
 
@@ -216,18 +227,22 @@ def update_enquiry(
     )
 
     db.execute(text("DELETE FROM enquiry_items WHERE enquiry_id = :id"), {"id": enquiry_id})
-    for item in body.items:
+    if body.items:
         db.execute(
             text("""
                 INSERT INTO enquiry_items (enquiry_id, product_id, product_name, quantity, specifications)
-                VALUES (:enquiry_id, :product_id, :product_name, :quantity, :specifications)
+                SELECT :enq_id,
+                       unnest(CAST(:product_ids AS int[])),
+                       unnest(CAST(:product_names AS text[])),
+                       unnest(CAST(:quantities AS int[])),
+                       unnest(CAST(:specs AS text[]))
             """),
             {
-                "enquiry_id": enquiry_id,
-                "product_id": item.product_id,
-                "product_name": item.product_name,
-                "quantity": item.quantity,
-                "specifications": item.specifications,
+                "enq_id": enquiry_id,
+                "product_ids": [i.product_id for i in body.items],
+                "product_names": [i.product_name for i in body.items],
+                "quantities": [i.quantity for i in body.items],
+                "specs": [i.specifications for i in body.items],
             },
         )
 

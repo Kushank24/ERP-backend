@@ -40,7 +40,7 @@ class ConvertToFGBody(BaseModel):
 @router.get("")
 def list_materials(
     q: Optional[str] = Query(default=None),
-    limit: int = Query(default=100, ge=1, le=500),
+    limit: int = Query(default=100, ge=1, le=10000),
     offset: int = Query(default=0, ge=0),
     db: Session = Depends(get_db),
     user: dict = Depends(get_current_user),

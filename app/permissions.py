@@ -20,10 +20,6 @@ _ROLE_MODULES: dict[str, list[str]] = {
     "admin": MODULES.copy(),
     "manager": [
         "dashboard",
-        "companies",
-        "enquiries",
-        "offers",
-        "product_catalog",
         "purchase_orders",
         "sales_orders",
         "inventory",
@@ -47,10 +43,9 @@ _ROLE_MODULES: dict[str, list[str]] = {
         "enquiries",
         "offers",
         "product_catalog",
-        "products_boq",
     ],
     "purchase_manager": ["dashboard", "purchase_orders", "inventory", "products_boq"],
-    "sales_manager": ["dashboard", "companies", "enquiries", "offers", "sales_orders", "finished_goods", "products_boq"],
+    "sales_manager": ["dashboard", "companies", "enquiries", "offers", "sales_orders", "finished_goods", "products_boq", "pricing"],
     "production_manager": [
         "dashboard",
         "inventory",

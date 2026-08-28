@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Optional
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
 from sqlalchemy import text
 from sqlalchemy.orm import Session
@@ -38,17 +38,53 @@ class ConvertToFGBody(BaseModel):
 
 
 @router.get("")
-def list_materials(db: Session = Depends(get_db), user: dict = Depends(get_current_user)):
+def list_materials(
+    q: Optional[str] = Query(default=None),
+    limit: int = Query(default=100, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
+    db: Session = Depends(get_db),
+    user: dict = Depends(get_current_user),
+):
     _ = user
+
+    # Aggregates over ALL materials (independent of search filter)
+    stats = db.execute(text("""
+        SELECT
+            COUNT(*)::int                                          AS total_count,
+            COALESCE(SUM(length_weight_nos * per_unit_cost), 0)   AS total_value,
+            COUNT(*) FILTER (WHERE length_weight_nos < 10)::int   AS low_stock_count
+        FROM materials
+    """)).mappings().first()
+
+    where = ""
+    params: dict = {}
+    if q and q.strip():
+        where = "WHERE name ILIKE :q"
+        params["q"] = f"%{q.strip()}%"
+
+    total = db.execute(
+        text(f"SELECT COUNT(*) FROM materials {where}"), params
+    ).scalar_one()
+
+    params["limit"] = limit
+    params["offset"] = offset
     rows = db.execute(
-        text(
-            """
+        text(f"""
             SELECT id, name, length_weight_nos, unit, per_unit_cost, created_at, updated_at
-            FROM materials ORDER BY name
-            """
-        )
+            FROM materials {where}
+            ORDER BY name
+            LIMIT :limit OFFSET :offset
+        """),
+        params,
     ).mappings().all()
-    return [dict(r) for r in rows]
+
+    return {
+        "items": [dict(r) for r in rows],
+        "total": total,
+        "total_count": stats["total_count"],
+        "total_value": float(stats["total_value"]),
+        "low_stock_count": stats["low_stock_count"],
+    }
 
 
 @router.post("", status_code=201)

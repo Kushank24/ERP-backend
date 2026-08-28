@@ -251,6 +251,10 @@ def create_so(
             },
         )
 
+    db.execute(text(
+        "UPDATE sales_order_items SET finished_good_id = NULL "
+        "WHERE finished_good_id IN (SELECT id FROM finished_goods WHERE quantity_in_stock <= 0)"
+    ))
     db.execute(text("DELETE FROM finished_goods WHERE quantity_in_stock <= 0"))
     db.commit()
     return _serialize_so(db, so_id)

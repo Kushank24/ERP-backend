@@ -111,7 +111,7 @@ def list_products(
     category: Optional[str] = Query(default=None),
     has_specs: bool = Query(default=False),
     page: int = Query(default=1, ge=1),
-    page_size: int = Query(default=100, ge=1, le=500),
+    page_size: int = Query(default=100, ge=1, le=10000),
     db: Session = Depends(get_db),
     user: dict = Depends(get_current_user),
 ):
@@ -252,6 +252,81 @@ def set_product_specifications(
         )
     db.commit()
     return get_product_specifications(product_id, db, _user)
+
+
+@router.get("/costs")
+def list_product_costs(
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=20, ge=1, le=100),
+    q: Optional[str] = Query(default=None),
+    db: Session = Depends(get_db),
+    user: dict = Depends(get_current_user),
+):
+    """Return products with BOQ-computed material cost, paginated."""
+    _ = user
+    limit = page_size
+    offset = (page - 1) * page_size
+
+    where = ""
+    params: dict = {"limit": limit, "offset": offset}
+    if q and q.strip():
+        where = "WHERE (p.name ILIKE :q OR COALESCE(p.product_code,'') ILIKE :q OR COALESCE(p.category,'') ILIKE :q)"
+        params["q"] = f"%{q.strip()}%"
+
+    rows = db.execute(text(f"""
+        WITH product_costs AS (
+            SELECT
+                p.id, p.name, p.product_code, p.category, p.default_unit_price,
+                COALESCE(SUM(
+                    CASE WHEN b.section_size > 0
+                         THEN b.quantity * b.section_size * COALESCE(m.per_unit_cost, 0)
+                         ELSE b.quantity * COALESCE(m.per_unit_cost, 0)
+                    END
+                ), 0) AS boq_cost,
+                COUNT(b.id)::int AS boq_lines,
+                BOOL_OR(b.id IS NOT NULL AND (m.id IS NULL OR m.per_unit_cost = 0)) AS has_missing_prices,
+                jsonb_agg(
+                    jsonb_build_object(
+                        'name', b.name,
+                        'section_size', b.section_size,
+                        'units', b.units,
+                        'quantity', b.quantity,
+                        'unit_cost', COALESCE(m.per_unit_cost, 0),
+                        'line_cost', CASE WHEN b.section_size > 0
+                                          THEN b.quantity * b.section_size * COALESCE(m.per_unit_cost, 0)
+                                          ELSE b.quantity * COALESCE(m.per_unit_cost, 0) END,
+                        'has_cost', (m.id IS NOT NULL AND m.per_unit_cost > 0)
+                    ) ORDER BY b.id
+                ) FILTER (WHERE b.id IS NOT NULL) AS material_costs
+            FROM products p
+            LEFT JOIN product_bill_of_quantity_relations r ON r.product_id = p.id
+            LEFT JOIN bill_of_quantities b ON b.id = r.bill_of_quantity_id
+            LEFT JOIN materials m ON LOWER(m.name) = LOWER(b.name)
+            {where}
+            GROUP BY p.id, p.name, p.product_code, p.category, p.default_unit_price
+            ORDER BY p.name
+        )
+        SELECT *, COUNT(*) OVER() AS total_count
+        FROM product_costs
+        LIMIT :limit OFFSET :offset
+    """), params).mappings().all()
+
+    total = 0
+    result = []
+    for r in rows:
+        d = dict(r)
+        total = int(d.pop("total_count") or 0)
+        d["boq_cost"] = float(d["boq_cost"] or 0)
+        d["has_missing_prices"] = bool(d["has_missing_prices"])
+        d["material_costs"] = d["material_costs"] or []
+        result.append(d)
+
+    if not result:
+        total = db.execute(
+            text(f"SELECT COUNT(*) FROM products p {where}"), params
+        ).scalar_one()
+
+    return {"items": result, "total": int(total), "page": page, "page_size": page_size}
 
 
 @router.get("/{product_id}")

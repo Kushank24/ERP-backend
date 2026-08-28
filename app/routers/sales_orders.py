@@ -183,28 +183,79 @@ def create_so(
     so_id = row[0]
 
     for tp, ld in line_totals:
+        qty_needed = float(ld["quantity_sold"])
+        fgid = ld.get("finished_good_id")
+
+        if fgid:
+            fg = db.execute(
+                text("SELECT id, product_name, quantity_in_stock FROM finished_goods WHERE id = :id FOR UPDATE"),
+                {"id": fgid},
+            ).mappings().first()
+            if not fg:
+                raise HTTPException(400, f"Finished good id {fgid} not found")
+            if float(fg["quantity_in_stock"]) < qty_needed:
+                raise HTTPException(
+                    400,
+                    f"Insufficient stock for '{fg['product_name']}': available {float(fg['quantity_in_stock'])}, required {qty_needed}",
+                )
+            db.execute(
+                text("UPDATE finished_goods SET quantity_in_stock = quantity_in_stock - :qty WHERE id = :id"),
+                {"qty": qty_needed, "id": fgid},
+            )
+        else:
+            pname = ld["product_name"].strip()
+            fg_rows = db.execute(
+                text(
+                    "SELECT id, quantity_in_stock FROM finished_goods "
+                    "WHERE product_name = :pname AND quantity_in_stock > 0 "
+                    "ORDER BY completion_date ASC FOR UPDATE"
+                ),
+                {"pname": pname},
+            ).mappings().all()
+            available = sum(float(r["quantity_in_stock"]) for r in fg_rows)
+            if available < qty_needed:
+                raise HTTPException(
+                    400,
+                    f"Insufficient stock for '{pname}': available {available}, required {qty_needed}",
+                )
+            rem = qty_needed
+            for fg in fg_rows:
+                if rem <= 0:
+                    break
+                deduct = min(rem, float(fg["quantity_in_stock"]))
+                db.execute(
+                    text("UPDATE finished_goods SET quantity_in_stock = quantity_in_stock - :d WHERE id = :id"),
+                    {"d": deduct, "id": fg["id"]},
+                )
+                rem -= deduct
+
         db.execute(
             text(
                 """
                 INSERT INTO sales_order_items (
                   sales_order_id, finished_good_id, product_name, product_code,
-                  quantity_sold, unit_price, total_price, notes
+                  quantity_sold, unit_price, total_price, notes, dispatched_qty
                 )
-                VALUES (:sid, :fgid, :pn, :pc, :qty, :up, :tp, :notes)
+                VALUES (:sid, :fgid, :pn, :pc, :qty, :up, :tp, :notes, :qty)
                 """
             ),
             {
                 "sid": so_id,
-                "fgid": ld.get("finished_good_id"),
+                "fgid": fgid,
                 "pn": ld["product_name"].strip(),
                 "pc": ld.get("product_code"),
-                "qty": ld["quantity_sold"],
+                "qty": qty_needed,
                 "up": ld["unit_price"],
                 "tp": tp,
                 "notes": ld.get("notes"),
             },
         )
 
+    db.execute(text(
+        "UPDATE sales_order_items SET finished_good_id = NULL "
+        "WHERE finished_good_id IN (SELECT id FROM finished_goods WHERE quantity_in_stock <= 0)"
+    ))
+    db.execute(text("DELETE FROM finished_goods WHERE quantity_in_stock <= 0"))
     db.commit()
     return _serialize_so(db, so_id)
 
@@ -441,4 +492,14 @@ def dispatch_so(so_id: int, body: DispatchCreate, db: Session = Depends(get_db),
 
     db.commit()
     return _serialize_so(db, so_id)
+
+
+@router.delete("/{so_id}", status_code=204)
+def delete_so(so_id: int, db: Session = Depends(get_db), user: dict = Depends(get_current_user)):
+    _ = user
+    if not db.execute(text("SELECT id FROM sales_orders WHERE id = :id"), {"id": so_id}).first():
+        raise HTTPException(404, "Sales order not found")
+    db.execute(text("DELETE FROM sales_order_items WHERE sales_order_id = :id"), {"id": so_id})
+    db.execute(text("DELETE FROM sales_orders WHERE id = :id"), {"id": so_id})
+    db.commit()
 

@@ -44,6 +44,19 @@ class Settings(BaseSettings):
     #          production_manager | inventory_clerk | viewer
     supabase_default_role: str = "admin"
 
+    # ------------------------------------------------------------------ #
+    # SMTP (bulk email campaigns)                                          #
+    # ------------------------------------------------------------------ #
+    smtp_host: str = "smtp.gmail.com"
+    smtp_port: int = 587
+    smtp_user: str = ""
+    smtp_password: str = ""
+    smtp_delay_seconds: float = 2.0  # pause between emails; 2s ≈ 1800/hr
+
+    # Public base URL used to build absolute image URLs embedded in emails.
+    # Set this to the server's public address, e.g. https://erp.esafe.co.in
+    base_url: str = "http://localhost:8000"
+
     # Comma-separated list of Supabase user e-mail addresses that always
     # receive admin access, regardless of their metadata role.
     # Example:  SUPABASE_ADMIN_EMAILS=alice@example.com,bob@example.com

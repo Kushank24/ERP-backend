@@ -13,11 +13,12 @@ MODULES = [
     "pricing",
     "work_orders",
     "finished_goods",
+    "email_campaigns",
     "settings",
 ]
 
 _ROLE_MODULES: dict[str, list[str]] = {
-    "admin": MODULES.copy(),
+    "admin": MODULES.copy(),  # admin gets email_campaigns via MODULES.copy()
     "manager": [
         "dashboard",
         "purchase_orders",

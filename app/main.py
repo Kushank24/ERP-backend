@@ -13,6 +13,7 @@ from .routers import (
     catalog_products,
     companies,
     dashboard,
+    email_campaigns,
     enquiries,
     finished_goods,
     materials,
@@ -154,6 +155,7 @@ app.include_router(purchase_orders.router, prefix="/api/v1")
 app.include_router(work_orders.router, prefix="/api/v1")
 app.include_router(finished_goods.router, prefix="/api/v1")
 app.include_router(sales_orders.router, prefix="/api/v1")
+app.include_router(email_campaigns.router, prefix="/api/v1")
 
 
 @app.get("/health")

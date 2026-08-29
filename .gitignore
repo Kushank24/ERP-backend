@@ -10,3 +10,4 @@ dist/
 build/
 .mypy_cache/
 .ruff_cache/
+uploaded_images/

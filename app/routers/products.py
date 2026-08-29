@@ -5,7 +5,10 @@ import io
 from collections import OrderedDict
 from typing import List, Optional
 
+import openpyxl
+from openpyxl.styles import Alignment, Font, PatternFill
 from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import text
 from sqlalchemy.orm import Session
@@ -421,6 +424,89 @@ def patch_product(
         db.execute(text(f"UPDATE products SET {', '.join(sets)} WHERE id = :id"), params)
         db.commit()
     return _product_dict(db, product_id)
+
+
+@router.get("/{product_id}/boq/download")
+def download_boq(
+    product_id: int,
+    db: Session = Depends(get_db),
+    user: dict = Depends(get_current_user),
+):
+    """Download the BOQ for a product as an Excel file."""
+    _ = user
+    product = db.execute(
+        text("SELECT id, name, product_code, category FROM products WHERE id = :id"),
+        {"id": product_id},
+    ).mappings().first()
+    if not product:
+        raise HTTPException(404, "Product not found")
+
+    boq = _load_boq(db, product_id)
+
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "BOQ"
+
+    # ── Header block ──────────────────────────────────────────────────────────
+    header_fill = PatternFill("solid", fgColor="1E3A5F")
+    header_font = Font(bold=True, color="FFFFFF", size=11)
+    label_font = Font(bold=True, size=10)
+
+    ws.merge_cells("A1:F1")
+    ws["A1"] = "Bill of Quantities"
+    ws["A1"].font = Font(bold=True, color="1E3A5F", size=14)
+    ws["A1"].alignment = Alignment(horizontal="left")
+
+    ws["A2"] = "Product:"
+    ws["A2"].font = label_font
+    ws["B2"] = str(product["name"])
+
+    ws["A3"] = "Code:"
+    ws["A3"].font = label_font
+    ws["B3"] = str(product["product_code"] or "—")
+
+    ws["A4"] = "Category:"
+    ws["A4"].font = label_font
+    ws["B4"] = str(product["category"] or "—")
+
+    ws.append([])  # blank row
+
+    # ── Column headers ─────────────────────────────────────────────────────────
+    col_headers = ["#", "Material Name", "Section Size", "Units", "Quantity", "Total Qty Consumed"]
+    ws.append(col_headers)
+    header_row = ws.max_row
+    for cell in ws[header_row]:
+        cell.fill = header_fill
+        cell.font = header_font
+        cell.alignment = Alignment(horizontal="center")
+
+    # ── Data rows ──────────────────────────────────────────────────────────────
+    for i, line in enumerate(boq, start=1):
+        ws.append([
+            i,
+            line.get("name", ""),
+            float(line.get("section_size") or 0),
+            line.get("units", ""),
+            float(line.get("quantity") or 0),
+            float(line.get("total_quantity_consumed") or 0),
+        ])
+
+    # ── Column widths ──────────────────────────────────────────────────────────
+    for col, width in zip("ABCDEF", [5, 35, 14, 10, 12, 22]):
+        ws.column_dimensions[col].width = width
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+
+    safe_name = (product["name"] or "product").replace(" ", "_").replace("/", "-")
+    filename = f"BOQ_{safe_name}.xlsx"
+
+    return StreamingResponse(
+        buf,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
 
 
 @router.post("/{product_id}/boq", status_code=201)

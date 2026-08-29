@@ -768,15 +768,21 @@ class PDFGenerationService:
                     if key == "GST Extra":
                         try:
                             if float(val.replace("%", "").strip()) == 0:
-                                val = "Inclusive"
+                                is_inr = currency.upper() in ("INR", "RS", "RS.")
+                                val = "Inclusive" if is_inr else "Not Applicable"
                         except (ValueError, TypeError):
                             pass
                     terms_rows.append([key, val])
         else:
+            if gst_pct == 0:
+                is_inr = currency.upper() in ("INR", "RS", "RS.")
+                _gst_label = "Inclusive" if is_inr else "Not Applicable"
+            else:
+                _gst_label = f"{gst_pct:.0f}%"
             terms_rows += [
                 ["Rates Quoted above are", "Ex-works / FOR Destination"],
                 ["Packing Charges", "3% Extra / Nil"],
-                ["GST Extra", "18%"],
+                ["GST Extra", _gst_label],
                 ["Transportation", "Extra to be paid by Buyer"],
                 ["Delivery", str(data.get("valid_until") or "As per mutual agreement")],
                 ["Payment", "As per mutual agreement"],

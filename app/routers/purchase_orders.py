@@ -4,7 +4,7 @@ import json
 from datetime import date
 from typing import List, Optional
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import text
@@ -126,18 +126,27 @@ def _serialize_po(db: Session, po_id: int) -> dict:
 
 
 @router.get("")
-def list_pos(db: Session = Depends(get_db), user: dict = Depends(get_current_user)):
+def list_pos(
+    q: Optional[str] = Query(default=None),
+    db: Session = Depends(get_db),
+    user: dict = Depends(get_current_user),
+):
     _ = user
+    where = ""
+    params: dict = {}
+    if q and q.strip():
+        where = "WHERE (p.purchase_number ILIKE :q OR COALESCE(s.name,'') ILIKE :q)"
+        params["q"] = f"%{q.strip()}%"
     rows = db.execute(
-        text(
-            """
+        text(f"""
             SELECT p.id, p.purchase_number, p.total_amount, p.status, p.order_delivery_date, p.created_at,
                    s.name AS supplier_name
             FROM purchase_orders p
             LEFT JOIN suppliers s ON s.id = p.supplier_id
+            {where}
             ORDER BY p.created_at DESC NULLS LAST
-            """
-        )
+        """),
+        params,
     ).mappings().all()
     return [dict(r) for r in rows]
 

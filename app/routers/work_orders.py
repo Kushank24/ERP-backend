@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import date
 from typing import List, Literal, Optional
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import text
@@ -117,17 +117,40 @@ def _compute_materials(db: Session, products: list) -> list:
 
 
 @router.get("")
-def list_wos(db: Session = Depends(get_db), user: dict = Depends(get_current_user)):
+def list_wos(
+    q: Optional[str] = Query(default=None),
+    status: Optional[str] = Query(default=None),
+    limit: int = Query(default=50, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
+    db: Session = Depends(get_db),
+    user: dict = Depends(get_current_user),
+):
     _ = user
-    rows = db.execute(
-        text(
-            """
-            SELECT id, work_order_number, po_number, party_name, status, delivery_date, creation_date
-            FROM work_orders ORDER BY creation_date DESC, id DESC
-            """
+    conditions = []
+    params: dict = {}
+    if q and q.strip():
+        conditions.append(
+            "(work_order_number ILIKE :q OR COALESCE(po_number,'') ILIKE :q OR COALESCE(party_name,'') ILIKE :q)"
         )
+        params["q"] = f"%{q.strip()}%"
+    if status and status.strip():
+        conditions.append("status = :status")
+        params["status"] = status.strip()
+    where = ("WHERE " + " AND ".join(conditions)) if conditions else ""
+    base = f"FROM work_orders {where}"
+    total = db.execute(text(f"SELECT COUNT(*) {base}"), params).scalar()
+    params["limit"] = limit
+    params["offset"] = offset
+    rows = db.execute(
+        text(f"""
+            SELECT id, work_order_number, po_number, party_name, status, delivery_date, creation_date
+            {base}
+            ORDER BY creation_date DESC, id DESC
+            LIMIT :limit OFFSET :offset
+        """),
+        params,
     ).mappings().all()
-    return [dict(r) for r in rows]
+    return {"data": [dict(r) for r in rows], "total": total}
 
 
 @router.get("/{wo_id}")

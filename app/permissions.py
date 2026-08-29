@@ -34,6 +34,7 @@ _ROLE_MODULES: dict[str, list[str]] = {
         "offers",
         "product_catalog",
         "inventory",
+        "products_boq",
         "work_orders",
         "finished_goods",
     ],

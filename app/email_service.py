@@ -29,14 +29,15 @@ _IMG_SRC_RE = re.compile(
 )
 
 
-def _embed_images(html: str) -> Tuple[str, List[Tuple[str, bytes, str]]]:
+def _embed_images(html: str) -> Tuple[str, List[Tuple[str, bytes, str]], List[Path]]:
     """
     Replace <img src="http[s]://…/email-campaigns/images/{name}"> with
-    src="cid:{cid}" and return (modified_html, [(cid, bytes, mime_type)]).
+    src="cid:{cid}" and return (modified_html, [(cid, bytes, mime_type)], [paths_loaded]).
     Images that cannot be read from disk are left as-is.
     """
     seen: dict[str, str] = {}
     parts: List[Tuple[str, bytes, str]] = []
+    paths: List[Path] = []
 
     def _replace(m: re.Match) -> str:
         filename = m.group(2)
@@ -49,10 +50,11 @@ def _embed_images(html: str) -> Tuple[str, List[Tuple[str, bytes, str]]]:
         seen[filename] = cid
         mime = mimetypes.guess_type(str(path))[0] or "image/jpeg"
         parts.append((cid, path.read_bytes(), mime))
+        paths.append(path)
         return f'src="cid:{cid}"'
 
     modified = _IMG_SRC_RE.sub(_replace, html)
-    return modified, parts
+    return modified, parts, paths
 
 _campaign_thread: threading.Thread | None = None
 _stop_event = threading.Event()
@@ -117,7 +119,7 @@ def _send_worker(
         # Images are base64-encoded here — this is the expensive step.
         # Per-recipient we only swap the To: header in the pre-built string.
         _TO_PLACEHOLDER = "__RCPT_PLACEHOLDER__"
-        html_to_send, inline_images = _embed_images(body_html)
+        html_to_send, inline_images, image_paths = _embed_images(body_html)
 
         tmpl = MIMEMultipart("related") if inline_images else MIMEMultipart("alternative")
         tmpl["Subject"] = subject
@@ -137,8 +139,15 @@ def _send_worker(
             img_part.add_header("Content-Disposition", "inline")
             tmpl.attach(img_part)
 
-        template_str = tmpl.as_string()           # serialised once
+        template_str = tmpl.as_string()           # serialised once — images fully encoded
         _to_line_old = f"To: {_TO_PLACEHOLDER}\n"
+
+        # Delete source image files — they are now embedded in template_str
+        for p in image_paths:
+            try:
+                p.unlink(missing_ok=True)
+            except Exception as exc:
+                logger.warning("Could not delete image file %s: %s", p, exc)
         cc_extras  = [a.strip() for a in cc.split(",")  if a.strip()] if cc  else []
         bcc_extras = [a.strip() for a in bcc.split(",") if a.strip()] if bcc else []
         # ─────────────────────────────────────────────────────────────────────

@@ -393,11 +393,6 @@ class PDFGenerationService:
             bottomMargin=36,
         )
         elements: list = []
-        self._add_wo_logo(elements)
-        title = Paragraph("<b>WORK ORDER</b>", self.title_style)
-        title.hAlign = "CENTER"
-        elements.append(title)
-        elements.append(Spacer(1, 12))
         self._add_wo_header(elements, data)
         self._add_wo_products_table(elements, data)
         self._add_signature_line(elements)
@@ -406,33 +401,52 @@ class PDFGenerationService:
         logger.info("Generated PDF for WO: %s", data.get("work_order_number"))
         return buffer
 
-    def _add_wo_logo(self, elements: list) -> None:
-        resolved = os.path.realpath(self.logo_path)
-        if os.path.isfile(resolved):
-            logo = Image(resolved, width=100, height=50)
-            logo.hAlign = "LEFT"
-            elements.append(logo)
-            elements.append(Spacer(1, 12))
-
     def _add_wo_header(self, elements: list, data: dict[str, Any]) -> None:
-        rows: list = [
+        from reportlab.lib.enums import TA_CENTER
+        resolved_logo = os.path.realpath(self.logo_path)
+        if os.path.isfile(resolved_logo):
+            logo_cell: Any = Image(resolved_logo, width=100, height=50)
+        else:
+            logo_cell = Paragraph("<b>E-SAFE</b>", self.title_style)
+
+        title_style = ParagraphStyle(
+            "WOTitle", fontSize=14, fontName="Helvetica-Bold", alignment=TA_CENTER, spaceAfter=6
+        )
+
+        details_rows: list = [
+            [Paragraph("<b>WORK ORDER</b>", title_style), ""],
+            [Paragraph("WO NUMBER", self.header_style), str(data.get("work_order_number", "") or "")],
             [Paragraph("PO NUMBER", self.header_style), str(data.get("po_number", "") or "")],
             [Paragraph("PO DATE", self.header_style), str(data.get("po_date", "") or "")],
             [Paragraph("PARTY NAME", self.header_style), str(data.get("party_name", "") or "")],
         ]
         delivery = self._fmt_date(data.get("delivery_date"))
         if delivery:
-            rows.append([Paragraph("DELIVERY DATE", self.header_style), delivery])
+            details_rows.append([Paragraph("DELIVERY DATE", self.header_style), delivery])
 
-        tbl = Table(rows, colWidths=[120, 200])
-        tbl.setStyle(TableStyle([
+        details_tbl = Table(details_rows, colWidths=[130, 270])
+        details_tbl.setStyle(TableStyle([
+            ("SPAN", (0, 0), (1, 0)),
+            ("ALIGN", (0, 0), (1, 0), "CENTER"),
+            ("FONTNAME", (0, 0), (1, 0), "Helvetica-Bold"),
+            ("FONTSIZE", (0, 0), (1, 0), 12),
+            ("TOPPADDING", (0, 0), (1, 0), 6),
+            ("BOTTOMPADDING", (0, 0), (1, 0), 6),
             ("GRID", (0, 0), (-1, -1), 1, colors.black),
-            ("BACKGROUND", (0, 0), (0, -1), colors.lightgrey),
+            ("BACKGROUND", (0, 1), (0, -1), colors.lightgrey),
+            ("FONTNAME", (0, 1), (0, -1), "Helvetica-Bold"),
             ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
-            ("FONTNAME", (0, 0), (0, -1), "Helvetica-Bold"),
+            ("FONTSIZE", (0, 1), (-1, -1), 9),
         ]))
-        elements.append(tbl)
-        elements.append(Spacer(1, 24))
+
+        header_table = Table([[logo_cell, details_tbl]], colWidths=[140, 400])
+        header_table.setStyle(TableStyle([
+            ("VALIGN", (0, 0), (-1, -1), "TOP"),
+            ("ALIGN", (0, 0), (0, 0), "LEFT"),
+            ("ALIGN", (1, 0), (1, 0), "RIGHT"),
+        ]))
+        elements.append(header_table)
+        elements.append(Spacer(1, 16))
 
     def _add_wo_products_table(self, elements: list, data: dict[str, Any]) -> None:
         products = data.get("products", [])
@@ -486,7 +500,7 @@ class PDFGenerationService:
                 str(mat.get("total_required", 0)),
             ])
 
-        mat_tbl = Table(mat_rows, colWidths=[200, 60, 55, 110, 110])
+        mat_tbl = Table(mat_rows, colWidths=[175, 85, 55, 110, 110])
         mat_tbl.setStyle(TableStyle([
             ("BACKGROUND", (0, 0), (-1, 0), colors.grey),
             ("TEXTCOLOR", (0, 0), (-1, 0), colors.whitesmoke),
@@ -789,6 +803,10 @@ class PDFGenerationService:
                 ["Manufactured by and Brand", "E-SAFE"],
                 ["Our GST No.", "08AACFE4028Q1Z5"],
             ]
+
+        notes_text = (data.get("notes") or "").strip()
+        if notes_text:
+            terms_rows.append(["Notes", notes_text])
 
         terms_label_st = ParagraphStyle("TL", fontSize=9, fontName="Helvetica-Bold", alignment=TA_LEFT)
         terms_val_st = ParagraphStyle("TV", fontSize=9, fontName="Helvetica", alignment=TA_LEFT)

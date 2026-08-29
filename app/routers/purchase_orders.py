@@ -487,6 +487,25 @@ def update_additional_costs(po_id: int, body: AdditionalCostsBody, db: Session =
     return _serialize_po(db, po_id)
 
 
+@router.delete("/{po_id}", status_code=204)
+def delete_po(
+    po_id: int,
+    db: Session = Depends(get_db),
+    user: dict = Depends(get_current_user),
+):
+    _ = user
+    row = db.execute(
+        text("SELECT status FROM purchase_orders WHERE id = :id"), {"id": po_id}
+    ).first()
+    if not row:
+        raise HTTPException(404, "Purchase order not found")
+    if row[0] == 4:
+        raise HTTPException(400, "Delivered purchase orders cannot be deleted")
+    db.execute(text("DELETE FROM purchase_order_lines WHERE purchase_order_id = :id"), {"id": po_id})
+    db.execute(text("DELETE FROM purchase_orders WHERE id = :id"), {"id": po_id})
+    db.commit()
+
+
 @router.get("/{po_id}/pdf")
 def download_po_pdf(
     po_id: int,

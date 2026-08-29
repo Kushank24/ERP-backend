@@ -156,8 +156,7 @@ async def upload_image(
     filename = f"{uuid.uuid4().hex}{ext}"
     dest = _UPLOAD_DIR / filename
     dest.write_bytes(raw)
-    url = f"{settings.base_url.rstrip('/')}/api/v1/email-campaigns/images/{filename}"
-    return {"url": url}
+    return {"url": f"/api/v1/email-campaigns/images/{filename}"}
 
 
 @router.get("/images/{filename}")

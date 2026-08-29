@@ -660,9 +660,12 @@ class PDFGenerationService:
             definition = str(item.get("definition") or "").strip()
             if definition:
                 desc_html += f"<br/>{escape(definition)}"
-            # Specifications with heading — same 9pt black font as original
+            # Specifications — model number always last
             specs = [s for s in (item.get("specifications") or []) if str(s.get("value") or "").strip()]
             if specs:
+                def _is_model(s: dict) -> bool:
+                    return "model" in str(s.get("spec_name") or "").lower()
+                specs = sorted(specs, key=lambda s: (1 if _is_model(s) else 0))
                 desc_html += "<br/>Specifications:"
                 for s in specs:
                     desc_html += (

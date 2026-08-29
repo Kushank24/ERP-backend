@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import date
 from typing import Optional
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
 from sqlalchemy import text
 from sqlalchemy.orm import Session
@@ -28,18 +28,29 @@ class FinishedGoodCreate(BaseModel):
 
 
 @router.get("")
-def list_fg(db: Session = Depends(get_db), user: dict = Depends(get_current_user)):
+def list_fg(
+    q: Optional[str] = Query(default=None),
+    db: Session = Depends(get_db),
+    user: dict = Depends(get_current_user),
+):
     _ = user
+    where = ""
+    params: dict = {}
+    if q and q.strip():
+        where = (
+            "WHERE (product_name ILIKE :q OR COALESCE(product_code,'') ILIKE :q"
+            " OR COALESCE(work_order_number,'') ILIKE :q OR COALESCE(party_name,'') ILIKE :q)"
+        )
+        params["q"] = f"%{q.strip()}%"
     rows = db.execute(
-        text(
-            """
+        text(f"""
             SELECT id, product_name, product_code, product_category, quantity_in_stock,
                    work_order_id, work_order_number, party_name, completion_date,
                    production_cost, notes, created_at, updated_at
-            FROM finished_goods
+            FROM finished_goods {where}
             ORDER BY completion_date DESC, id DESC
-            """
-        )
+        """),
+        params,
     ).mappings().all()
     return [dict(r) for r in rows]
 

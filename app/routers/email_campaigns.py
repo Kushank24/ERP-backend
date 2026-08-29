@@ -36,10 +36,12 @@ CREATE TABLE IF NOT EXISTS email_campaigns (
     total_recipients  INTEGER DEFAULT 0,
     sent_count        INTEGER DEFAULT 0,
     failed_count      INTEGER DEFAULT 0,
+    error_message     TEXT,
     created_at        TIMESTAMP DEFAULT now(),
     updated_at        TIMESTAMP DEFAULT now(),
     completed_at      TIMESTAMP
 );
+ALTER TABLE email_campaigns ADD COLUMN IF NOT EXISTS error_message TEXT;
 CREATE TABLE IF NOT EXISTS email_campaign_failures (
     id           SERIAL PRIMARY KEY,
     campaign_id  INTEGER REFERENCES email_campaigns(id) ON DELETE CASCADE,
@@ -199,7 +201,7 @@ def list_campaigns(db: Session = Depends(get_db), user: dict = Depends(get_curre
     rows = db.execute(
         text(
             "SELECT id, subject, reply_to, cc, bcc, status, total_recipients, "
-            "sent_count, failed_count, created_at, completed_at "
+            "sent_count, failed_count, error_message, created_at, completed_at "
             "FROM email_campaigns ORDER BY id DESC LIMIT 50"
         )
     ).mappings().all()

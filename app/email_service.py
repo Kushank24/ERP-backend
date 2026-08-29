@@ -68,7 +68,8 @@ def stop_campaign():
     _stop_event.set()
 
 
-def _update_db(campaign_id: int, sent_delta: int = 0, failed_delta: int = 0, status: str | None = None):
+def _update_db(campaign_id: int, sent_delta: int = 0, failed_delta: int = 0,
+               status: str | None = None, error_message: str | None = None):
     from sqlalchemy import text
     try:
         with SessionLocal() as db:
@@ -85,6 +86,9 @@ def _update_db(campaign_id: int, sent_delta: int = 0, failed_delta: int = 0, sta
                 params["status"] = status
                 if status in ("completed", "stopped", "failed"):
                     parts.append("completed_at = now()")
+            if error_message:
+                parts.append("error_message = :errmsg")
+                params["errmsg"] = error_message[:500]
             db.execute(text(f"UPDATE email_campaigns SET {', '.join(parts)} WHERE id = :id"), params)
             db.commit()
     except Exception as exc:
@@ -105,8 +109,11 @@ def _send_worker(
     _stop_event.clear()
 
     def reconnect():
-        s = smtplib.SMTP(settings.smtp_host, settings.smtp_port, timeout=30)
-        s.starttls()
+        if settings.smtp_port == 465:
+            s = smtplib.SMTP_SSL(settings.smtp_host, settings.smtp_port, timeout=30)
+        else:
+            s = smtplib.SMTP(settings.smtp_host, settings.smtp_port, timeout=30)
+            s.starttls()
         s.login(settings.smtp_user, settings.smtp_password)
         return s
 
@@ -194,7 +201,7 @@ def _send_worker(
 
     except Exception as exc:
         logger.error("Campaign %d worker crashed: %s", campaign_id, exc)
-        _update_db(campaign_id, status="failed")
+        _update_db(campaign_id, status="failed", error_message=str(exc))
     finally:
         if smtp:
             try:

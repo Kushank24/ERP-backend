@@ -4,7 +4,7 @@ import json
 from datetime import date
 from typing import List, Optional
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
 from sqlalchemy import text
 from sqlalchemy.orm import Session
@@ -94,15 +94,29 @@ def _serialize_so(db: Session, so_id: int) -> dict:
 
 
 @router.get("")
-def list_so(db: Session = Depends(get_db), user: dict = Depends(get_current_user)):
+def list_so(
+    date_from: Optional[date] = Query(default=None),
+    date_to: Optional[date] = Query(default=None),
+    db: Session = Depends(get_db),
+    user: dict = Depends(get_current_user),
+):
     _ = user
+    conds = []
+    params: dict = {}
+    if date_from:
+        conds.append("created_at::date >= :date_from")
+        params["date_from"] = date_from
+    if date_to:
+        conds.append("created_at::date <= :date_to")
+        params["date_to"] = date_to
+    where = ("WHERE " + " AND ".join(conds)) if conds else ""
     rows = db.execute(
-        text(
-            """
+        text(f"""
             SELECT id, invoice_number, company_name, total_amount, status, sales_date, created_at, payment_received, payment_amount
-            FROM sales_orders ORDER BY created_at DESC NULLS LAST
-            """
-        )
+            FROM sales_orders {where}
+            ORDER BY created_at DESC NULLS LAST
+        """),
+        params,
     ).mappings().all()
     return [dict(r) for r in rows]
 

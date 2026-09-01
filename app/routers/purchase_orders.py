@@ -128,15 +128,24 @@ def _serialize_po(db: Session, po_id: int) -> dict:
 @router.get("")
 def list_pos(
     q: Optional[str] = Query(default=None),
+    date_from: Optional[date] = Query(default=None),
+    date_to: Optional[date] = Query(default=None),
     db: Session = Depends(get_db),
     user: dict = Depends(get_current_user),
 ):
     _ = user
-    where = ""
+    conds = []
     params: dict = {}
     if q and q.strip():
-        where = "WHERE (p.purchase_number ILIKE :q OR COALESCE(s.name,'') ILIKE :q)"
+        conds.append("(p.purchase_number ILIKE :q OR COALESCE(s.name,'') ILIKE :q)")
         params["q"] = f"%{q.strip()}%"
+    if date_from:
+        conds.append("p.created_at::date >= :date_from")
+        params["date_from"] = date_from
+    if date_to:
+        conds.append("p.created_at::date <= :date_to")
+        params["date_to"] = date_to
+    where = ("WHERE " + " AND ".join(conds)) if conds else ""
     rows = db.execute(
         text(f"""
             SELECT p.id, p.purchase_number, p.total_amount, p.status, p.order_delivery_date, p.created_at,
@@ -351,10 +360,14 @@ def patch_po_status(
             pending_qty = total_qty - del_qty
 
             if pending_qty > 0:
-                # Add to inventory
+                # Add to inventory — case-insensitive match so "Widget A" and "widget a" merge
                 updated = db.execute(
-                    text("UPDATE materials SET length_weight_nos = length_weight_nos + :qty WHERE name = :name RETURNING id"),
-                    {"qty": pending_qty, "name": mat_name}
+                    text(
+                        "UPDATE materials SET length_weight_nos = length_weight_nos + :qty, "
+                        "per_unit_cost = :cost, updated_at = now() "
+                        "WHERE LOWER(TRIM(name)) = LOWER(TRIM(:name)) RETURNING id"
+                    ),
+                    {"qty": pending_qty, "name": mat_name, "cost": float(line["per_unit_cost"])}
                 ).first()
                 if not updated:
                     db.execute(
@@ -413,10 +426,14 @@ def receive_po_items(
         mat_name = line["material_name"].strip()
         receive_qty = float(item.receive_qty)
 
-        # Update inventory
+        # Update inventory — case-insensitive match so "Widget A" and "widget a" merge
         updated = db.execute(
-            text("UPDATE materials SET length_weight_nos = length_weight_nos + :qty WHERE name = :name RETURNING id"),
-            {"qty": receive_qty, "name": mat_name}
+            text(
+                "UPDATE materials SET length_weight_nos = length_weight_nos + :qty, "
+                "per_unit_cost = :cost, updated_at = now() "
+                "WHERE LOWER(TRIM(name)) = LOWER(TRIM(:name)) RETURNING id"
+            ),
+            {"qty": receive_qty, "name": mat_name, "cost": float(line["per_unit_cost"])}
         ).first()
         if not updated:
             db.execute(

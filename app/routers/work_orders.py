@@ -120,6 +120,8 @@ def _compute_materials(db: Session, products: list) -> list:
 def list_wos(
     q: Optional[str] = Query(default=None),
     status: Optional[str] = Query(default=None),
+    date_from: Optional[date] = Query(default=None),
+    date_to: Optional[date] = Query(default=None),
     limit: int = Query(default=50, ge=1, le=500),
     offset: int = Query(default=0, ge=0),
     db: Session = Depends(get_db),
@@ -136,6 +138,12 @@ def list_wos(
     if status and status.strip():
         conditions.append("status = :status")
         params["status"] = status.strip()
+    if date_from:
+        conditions.append("creation_date >= :date_from")
+        params["date_from"] = date_from
+    if date_to:
+        conditions.append("creation_date <= :date_to")
+        params["date_to"] = date_to
     where = ("WHERE " + " AND ".join(conditions)) if conditions else ""
     base = f"FROM work_orders {where}"
     total = db.execute(text(f"SELECT COUNT(*) {base}"), params).scalar()

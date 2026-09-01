@@ -93,6 +93,8 @@ def list_enquiries(
     status: Optional[str] = None,
     company_id: Optional[int] = None,
     q: Optional[str] = None,
+    date_from: Optional[date] = None,
+    date_to: Optional[date] = None,
     limit: int = 50,
     offset: int = 0,
     db: Session = Depends(get_db),
@@ -109,6 +111,12 @@ def list_enquiries(
     if q:
         where.append("(c.name ILIKE :q OR e.enquiry_number ILIKE :q OR e.reference_number ILIKE :q)")
         params["q"] = f"%{q}%"
+    if date_from:
+        where.append("e.created_at::date >= :date_from")
+        params["date_from"] = date_from
+    if date_to:
+        where.append("e.created_at::date <= :date_to")
+        params["date_to"] = date_to
 
     clause = ("WHERE " + " AND ".join(where)) if where else ""
     base = f"""
@@ -122,7 +130,7 @@ def list_enquiries(
     rows = db.execute(
         text(f"""
             SELECT e.*, c.name AS company_name {base}
-            ORDER BY e.enquiry_date DESC, e.id DESC
+            ORDER BY e.created_at DESC, e.id DESC
             LIMIT :limit OFFSET :offset
         """),
         params,

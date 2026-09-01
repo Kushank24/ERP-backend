@@ -99,6 +99,10 @@ def create_material(
             """
             INSERT INTO materials (name, length_weight_nos, unit, per_unit_cost)
             VALUES (:name, :lwn, :unit, :cost)
+            ON CONFLICT (name) DO UPDATE
+                SET length_weight_nos = materials.length_weight_nos + EXCLUDED.length_weight_nos,
+                    per_unit_cost     = EXCLUDED.per_unit_cost,
+                    updated_at        = now()
             RETURNING id, name, length_weight_nos, unit, per_unit_cost, created_at, updated_at
             """
         ),

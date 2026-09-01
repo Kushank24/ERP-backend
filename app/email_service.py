@@ -83,8 +83,9 @@ def _send_via_resend(
     cc: Optional[str],
     bcc: Optional[str],
 ) -> None:
+    from_email = settings.resend_from_email or settings.smtp_user
     payload: dict = {
-        "from": settings.smtp_user,
+        "from": from_email,
         "to": [to_email],
         "subject": subject,
         "html": html,
@@ -111,6 +112,7 @@ def _send_via_resend(
         headers={
             "Authorization": f"Bearer {settings.resend_api_key}",
             "Content-Type": "application/json",
+            "User-Agent": "esafe-erp/1.0",
         },
         method="POST",
     )
@@ -119,8 +121,8 @@ def _send_via_resend(
             if resp.status not in (200, 201):
                 raise RuntimeError(f"Resend {resp.status}: {resp.read().decode()[:200]}")
     except urllib.error.HTTPError as exc:
-        body = exc.read().decode()[:300]
-        raise RuntimeError(f"Resend {exc.code}: {body}") from exc
+        body = exc.read().decode()[:500]
+        raise RuntimeError(f"Resend HTTP {exc.code}: {body}") from exc
 
 
 # ── DB helpers ────────────────────────────────────────────────────────────────
@@ -197,7 +199,19 @@ def _send_worker(
     html_to_send, inline_images, image_paths = _embed_images(body_html)
     _delete_image_files(image_paths)   # files no longer needed after this point
 
-    use_resend = bool(settings.resend_api_key)
+    provider = settings.email_provider.lower()
+    if provider == "resend":
+        use_resend = True
+    elif provider == "smtp":
+        use_resend = False
+    else:  # auto
+        use_resend = bool(settings.resend_api_key)
+
+    if use_resend and not settings.resend_api_key:
+        logger.error("EMAIL_PROVIDER=resend but RESEND_API_KEY is not set; falling back to SMTP")
+        use_resend = False
+
+    logger.info("Campaign %d: using %s", campaign_id, "Resend" if use_resend else "SMTP")
 
     try:
         if use_resend:

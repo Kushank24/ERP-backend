@@ -283,9 +283,6 @@ def update_offer(
     db: Session = Depends(get_db),
     _user: dict = Depends(get_current_user),
 ):
-    if _get_status(db, offer_id) == "accepted":
-        raise HTTPException(400, "Accepted offers cannot be edited")
-
     totals = _calc_totals(body.items, body.packing_charges_pct, body.freight_charges, body.gst_pct)
 
     db.execute(
@@ -335,9 +332,6 @@ def update_status(
     if body.status not in VALID_STATUSES:
         raise HTTPException(400, f"Invalid status. Choose from: {VALID_STATUSES}")
 
-    if _get_status(db, offer_id) == "accepted":
-        raise HTTPException(400, "Accepted offers cannot be changed")
-
     db.execute(
         text("""
             UPDATE offers
@@ -346,72 +340,6 @@ def update_status(
         """),
         {"id": offer_id, "status": body.status, "comments": body.follow_up_comments},
     )
-
-    # Auto-create Sales Order when an offer is accepted
-    if body.status == "accepted":
-        offer = db.execute(
-            text("""
-                SELECT o.*, c.name AS company_name, c.gstin AS company_gstin
-                FROM offers o
-                LEFT JOIN companies c ON c.id = o.company_id
-                WHERE o.id = :id
-            """),
-            {"id": offer_id},
-        ).mappings().first()
-
-    if body.status == "accepted" and offer and not offer.get("sales_order_id"):
-        so_row = db.execute(
-            text("""
-                INSERT INTO sales_orders
-                    (invoice_number, company_name, company_gstin, sales_date, gst_rate, status, notes)
-                VALUES
-                    (:invoice_number, :company_name, :company_gstin, :sales_date, :gst_rate, 'pending', :notes)
-                RETURNING id
-            """),
-            {
-                "invoice_number": f"SO-{offer['offer_number']}",
-                "company_name": offer.get("company_name") or "Unknown",
-                "company_gstin": offer.get("company_gstin"),
-                "sales_date": offer["offer_date"],
-                "gst_rate": float(offer["gst_pct"]),
-                "notes": f"Auto-created from offer {offer['offer_number']}",
-            },
-        ).mappings().first()
-        so_id = so_row["id"]
-
-        # Copy offer items → sales_order_lines
-        items = db.execute(
-            text("SELECT * FROM offer_items WHERE offer_id = :id ORDER BY id"),
-            {"id": offer_id},
-        ).mappings().all()
-        for item in items:
-            db.execute(
-                text("""
-                    INSERT INTO sales_order_lines
-                        (sales_order_id, product_name, quantity_sold, unit_price, notes)
-                    VALUES
-                        (:so_id, :product_name, :qty, :unit_price, NULL)
-                """),
-                {
-                    "so_id": so_id,
-                    "product_name": item["description"],
-                    "qty": item["quantity"],
-                    "unit_price": float(item["unit_price"]),
-                },
-            )
-
-        db.execute(
-            text("UPDATE offers SET sales_order_id = :so_id WHERE id = :id"),
-            {"so_id": so_id, "id": offer_id},
-        )
-
-        # Mark linked enquiry as completed
-        if offer.get("enquiry_id"):
-            db.execute(
-                text("UPDATE enquiries SET status = 'completed' WHERE id = :id"),
-                {"id": offer["enquiry_id"]},
-            )
-
     db.commit()
     return _serialize(db, offer_id)
 
@@ -422,8 +350,6 @@ def delete_offer(
     db: Session = Depends(get_db),
     _user: dict = Depends(get_current_user),
 ):
-    if _get_status(db, offer_id) == "accepted":
-        raise HTTPException(400, "Accepted offers cannot be deleted")
     db.execute(text("DELETE FROM offers WHERE id = :id"), {"id": offer_id})
     db.commit()
 

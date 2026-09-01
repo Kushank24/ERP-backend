@@ -283,9 +283,6 @@ def update_offer(
     db: Session = Depends(get_db),
     _user: dict = Depends(get_current_user),
 ):
-    if _get_status(db, offer_id) == "accepted":
-        raise HTTPException(400, "Accepted offers cannot be edited")
-
     totals = _calc_totals(body.items, body.packing_charges_pct, body.freight_charges, body.gst_pct)
 
     db.execute(
@@ -335,9 +332,6 @@ def update_status(
     if body.status not in VALID_STATUSES:
         raise HTTPException(400, f"Invalid status. Choose from: {VALID_STATUSES}")
 
-    if _get_status(db, offer_id) == "accepted":
-        raise HTTPException(400, "Accepted offers cannot be changed")
-
     db.execute(
         text("""
             UPDATE offers
@@ -356,8 +350,6 @@ def delete_offer(
     db: Session = Depends(get_db),
     _user: dict = Depends(get_current_user),
 ):
-    if _get_status(db, offer_id) == "accepted":
-        raise HTTPException(400, "Accepted offers cannot be deleted")
     db.execute(text("DELETE FROM offers WHERE id = :id"), {"id": offer_id})
     db.commit()
 

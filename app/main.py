@@ -9,6 +9,7 @@ from sqlalchemy.exc import OperationalError, SQLAlchemyError
 
 from .config import settings
 from .routers import (
+    analytics,
     auth,
     catalog_products,
     companies,
@@ -156,6 +157,7 @@ app.include_router(work_orders.router, prefix="/api/v1")
 app.include_router(finished_goods.router, prefix="/api/v1")
 app.include_router(sales_orders.router, prefix="/api/v1")
 app.include_router(email_campaigns.router, prefix="/api/v1")
+app.include_router(analytics.router, prefix="/api/v1")
 
 
 @app.get("/health")

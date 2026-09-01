@@ -57,10 +57,19 @@ class Settings(BaseSettings):
     # Set this to the server's public address, e.g. https://erp.esafe.co.in
     base_url: str = "http://localhost:8000"
 
-    # Resend API key (https://resend.com). When set, emails are sent via the
-    # Resend HTTP API instead of raw SMTP — required on hosts that block
-    # outbound SMTP ports (e.g. Railway).
+    # Resend API key (https://resend.com).
     resend_api_key: str = ""
+
+    # Explicit email provider override.
+    #   smtp   → always use SMTP (local dev)
+    #   resend → always use Resend HTTP API (production)
+    #   auto   → use Resend if RESEND_API_KEY is set, else SMTP (default)
+    email_provider: str = "auto"
+
+    # Verified sender address used as the From: header when sending via Resend.
+    # Must match a domain verified in your Resend dashboard.
+    # Defaults to smtp_user if not set.
+    resend_from_email: str = ""
 
     # Comma-separated list of Supabase user e-mail addresses that always
     # receive admin access, regardless of their metadata role.

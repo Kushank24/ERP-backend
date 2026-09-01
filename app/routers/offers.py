@@ -162,6 +162,8 @@ def list_offers(
     status: Optional[str] = None,
     company_id: Optional[int] = None,
     q: Optional[str] = None,
+    date_from: Optional[date] = None,
+    date_to: Optional[date] = None,
     limit: int = 50,
     offset: int = 0,
     db: Session = Depends(get_db),
@@ -178,6 +180,12 @@ def list_offers(
     if q:
         where.append("(c.name ILIKE :q OR o.offer_number ILIKE :q)")
         params["q"] = f"%{q}%"
+    if date_from:
+        where.append("o.created_at::date >= :date_from")
+        params["date_from"] = date_from
+    if date_to:
+        where.append("o.created_at::date <= :date_to")
+        params["date_to"] = date_to
 
     clause = ("WHERE " + " AND ".join(where)) if where else ""
     base = f"""
@@ -192,7 +200,7 @@ def list_offers(
     rows = db.execute(
         text(f"""
             SELECT o.*, c.name AS company_name, e.enquiry_number {base}
-            ORDER BY o.offer_date DESC, o.id DESC
+            ORDER BY o.created_at DESC, o.id DESC
             LIMIT :limit OFFSET :offset
         """),
         params,

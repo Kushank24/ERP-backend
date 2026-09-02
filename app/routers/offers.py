@@ -99,7 +99,7 @@ def _serialize(db: Session, offer_id: int) -> dict:
 
     items = db.execute(
         text("""
-            SELECT oi.*, cp.model_name AS product_name_resolved
+            SELECT oi.*, cp.model_name AS product_name_resolved, cp.definition
             FROM offer_items oi
             LEFT JOIN catalog_products cp ON cp.id = oi.product_id
             WHERE oi.offer_id = :id

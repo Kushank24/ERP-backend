@@ -854,3 +854,221 @@ class PDFGenerationService:
         buffer.seek(0)
         logger.info("Generated offer PDF: %s", data.get("offer_number"))
         return buffer
+
+    # ------------------------------------------------------------------
+    # Public: BOQ PDF
+    # ------------------------------------------------------------------
+
+    def generate_boq_pdf(self, product: dict[str, Any], boq_lines: list[dict[str, Any]]) -> io.BytesIO:
+        """Generate a polished Bill of Quantities PDF for a product."""
+        from datetime import date as _date
+
+        DARK_BLUE = colors.HexColor("#1E3A5F")
+        LIGHT_BLUE = colors.HexColor("#EAF0F8")
+        MID_GREY = colors.HexColor("#F5F5F5")
+
+        buffer = io.BytesIO()
+        pdf = SimpleDocTemplate(
+            buffer,
+            pagesize=letter,
+            leftMargin=0.55 * inch,
+            rightMargin=0.55 * inch,
+            topMargin=0.5 * inch,
+            bottomMargin=0.5 * inch,
+        )
+        elements: list = []
+
+        # ── Logo + Title header ──────────────────────────────────────
+        logo_cell: Any
+        try:
+            logo_cell = Image(self.logo_path, width=90, height=45)
+        except Exception:
+            logo_cell = Paragraph("<b>E-SAFE</b>", self.title_style)
+
+        title_st = ParagraphStyle("BOQTitle", fontSize=18, fontName="Helvetica-Bold",
+                                   textColor=DARK_BLUE, alignment=2, leading=22)
+        sub_st = ParagraphStyle("BOQSub", fontSize=9, fontName="Helvetica",
+                                 textColor=colors.HexColor("#555555"), alignment=2)
+        title_cell = [
+            Paragraph("BILL OF QUANTITIES", title_st),
+            Paragraph("E-Safe Enterprises  |  G-176 Boranada Industrial Area, Jodhpur 342012", sub_st),
+            Paragraph("+91-9773313466  |  accounts@esafe.co.in  |  GSTIN: 08AACFE4028Q1Z5", sub_st),
+        ]
+        hdr_tbl = Table([[logo_cell, title_cell]], colWidths=[100, None])
+        hdr_tbl.setStyle(TableStyle([
+            ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+            ("ALIGN", (0, 0), (0, 0), "LEFT"),
+            ("ALIGN", (1, 0), (1, 0), "RIGHT"),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+        ]))
+        elements.append(hdr_tbl)
+
+        # Blue rule
+        rule_tbl = Table([[""]], colWidths=[pdf.width])
+        rule_tbl.setStyle(TableStyle([("LINEABOVE", (0, 0), (-1, -1), 2, DARK_BLUE)]))
+        elements.append(rule_tbl)
+        elements.append(Spacer(1, 8))
+
+        # ── Product info box ─────────────────────────────────────────
+        lbl_st = ParagraphStyle("Lbl", fontSize=8, fontName="Helvetica-Bold",
+                                 textColor=colors.HexColor("#555555"))
+        val_st = ParagraphStyle("Val", fontSize=10, fontName="Helvetica-Bold",
+                                 textColor=DARK_BLUE)
+        val_normal_st = ParagraphStyle("ValN", fontSize=9, fontName="Helvetica",
+                                        textColor=colors.black)
+
+        name = str(product.get("name") or "—")
+        code = str(product.get("product_code") or "—")
+        category = str(product.get("category") or "—")
+        description = str(product.get("description") or "")
+        unit_price = product.get("default_unit_price")
+        price_str = f"₹ {float(unit_price):,.2f}" if unit_price else "—"
+        generated_on = _date.today().strftime("%d %b %Y")
+
+        info_data = [
+            [
+                [Paragraph("PRODUCT NAME", lbl_st), Paragraph(escape(name), val_st)],
+                [Paragraph("PRODUCT CODE", lbl_st), Paragraph(escape(code), val_normal_st)],
+                [Paragraph("CATEGORY", lbl_st), Paragraph(escape(category), val_normal_st)],
+            ],
+            [
+                [Paragraph("UNIT PRICE", lbl_st), Paragraph(price_str, val_normal_st)],
+                [Paragraph("LINES", lbl_st), Paragraph(str(len(boq_lines)), val_normal_st)],
+                [Paragraph("GENERATED ON", lbl_st), Paragraph(generated_on, val_normal_st)],
+            ],
+        ]
+
+        def _info_cell(parts: list) -> Table:
+            t = Table([[p] for p in parts], colWidths=[None])
+            t.setStyle(TableStyle([
+                ("BACKGROUND", (0, 0), (-1, -1), LIGHT_BLUE),
+                ("LEFTPADDING", (0, 0), (-1, -1), 8),
+                ("RIGHTPADDING", (0, 0), (-1, -1), 8),
+                ("TOPPADDING", (0, 0), (0, 0), 6),
+                ("BOTTOMPADDING", (0, -1), (-1, -1), 6),
+                ("TOPPADDING", (0, 1), (-1, -1), 1),
+                ("BOTTOMPADDING", (0, 0), (-1, -2), 1),
+            ]))
+            return t
+
+        col_w = pdf.width / 3 - 4
+        row1 = [_info_cell(parts) for parts in info_data[0]]
+        row2 = [_info_cell(parts) for parts in info_data[1]]
+        info_grid = Table([row1, row2], colWidths=[col_w, col_w, col_w],
+                           rowHeights=None)
+        info_grid.setStyle(TableStyle([
+            ("VALIGN", (0, 0), (-1, -1), "TOP"),
+            ("LEFTPADDING", (0, 0), (-1, -1), 3),
+            ("RIGHTPADDING", (0, 0), (-1, -1), 3),
+            ("TOPPADDING", (0, 0), (-1, -1), 3),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
+        ]))
+        elements.append(info_grid)
+
+        # Description block (if present)
+        if description:
+            elements.append(Spacer(1, 6))
+            desc_data = [
+                [Paragraph("DESCRIPTION", lbl_st)],
+                [Paragraph(escape(description), val_normal_st)],
+            ]
+            desc_tbl = Table(desc_data, colWidths=[pdf.width])
+            desc_tbl.setStyle(TableStyle([
+                ("BACKGROUND", (0, 0), (-1, -1), LIGHT_BLUE),
+                ("LEFTPADDING", (0, 0), (-1, -1), 8),
+                ("RIGHTPADDING", (0, 0), (-1, -1), 8),
+                ("TOPPADDING", (0, 0), (-1, 0), 6),
+                ("BOTTOMPADDING", (0, 0), (-1, 0), 2),
+                ("TOPPADDING", (0, 1), (-1, 1), 2),
+                ("BOTTOMPADDING", (0, 1), (-1, 1), 6),
+            ]))
+            elements.append(desc_tbl)
+
+        elements.append(Spacer(1, 12))
+
+        # ── BOQ materials table ──────────────────────────────────────
+        elements.append(Paragraph(
+            "<b>Material Requirements</b>",
+            ParagraphStyle("SecHdr", fontSize=11, fontName="Helvetica-Bold",
+                            textColor=DARK_BLUE, spaceAfter=4),
+        ))
+
+        if not boq_lines:
+            elements.append(Paragraph("No BOQ lines defined for this product.", self.normal_style))
+        else:
+            col_h_st = ParagraphStyle("ColH", fontSize=9, fontName="Helvetica-Bold",
+                                       textColor=colors.white, alignment=1)
+            tbl_data = [[
+                Paragraph("#", col_h_st),
+                Paragraph("Material Name", col_h_st),
+                Paragraph("Section Size", col_h_st),
+                Paragraph("Units", col_h_st),
+                Paragraph("Qty per Unit", col_h_st),
+                Paragraph("Total Qty Consumed", col_h_st),
+            ]]
+            total_consumed = 0.0
+            for idx, line in enumerate(boq_lines, 1):
+                sec = float(line.get("section_size") or 0)
+                qty = float(line.get("quantity") or 0)
+                consumed = float(line.get("total_quantity_consumed") or 0)
+                total_consumed += consumed
+                sec_str = f"{sec:g}" if sec else "—"
+                tbl_data.append([
+                    str(idx),
+                    Paragraph(escape(str(line.get("name") or "")), self.normal_style),
+                    sec_str,
+                    str(line.get("units") or "Nos"),
+                    f"{qty:g}",
+                    f"{consumed:g}",
+                ])
+            # Totals row
+            tbl_data.append([
+                "", Paragraph("<b>TOTAL</b>", self.normal_style), "", "", "",
+                Paragraph(f"<b>{total_consumed:g}</b>", self.normal_style),
+            ])
+
+            cw = [30, None, 80, 60, 80, 110]
+            boq_tbl = Table(tbl_data, colWidths=cw, repeatRows=1)
+
+            n = len(tbl_data)
+            t_style = [
+                # Header
+                ("BACKGROUND", (0, 0), (-1, 0), DARK_BLUE),
+                ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+                ("ALIGN", (0, 0), (-1, 0), "CENTER"),
+                ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+                # Data
+                ("FONTSIZE", (0, 0), (-1, -1), 9),
+                ("GRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#CCCCCC")),
+                ("LINEBELOW", (0, 0), (-1, 0), 1.5, DARK_BLUE),
+                ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+                ("ALIGN", (0, 1), (0, -1), "CENTER"),
+                ("ALIGN", (2, 1), (-1, n - 2), "CENTER"),
+                ("LEFTPADDING", (1, 1), (1, -1), 6),
+                ("TOPPADDING", (0, 0), (-1, -1), 4),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+                # Alternating rows
+                *[("BACKGROUND", (0, r), (-1, r), MID_GREY)
+                  for r in range(2, n - 1, 2)],
+                # Totals row
+                ("BACKGROUND", (0, n - 1), (-1, n - 1), LIGHT_BLUE),
+                ("LINEABOVE", (0, n - 1), (-1, n - 1), 1.5, DARK_BLUE),
+                ("ALIGN", (5, n - 1), (5, n - 1), "CENTER"),
+            ]
+            boq_tbl.setStyle(TableStyle(t_style))
+            elements.append(boq_tbl)
+
+        # ── Footer ───────────────────────────────────────────────────
+        elements.append(Spacer(1, 16))
+        footer_st = ParagraphStyle("Footer", fontSize=8, fontName="Helvetica",
+                                    textColor=colors.HexColor("#888888"), alignment=1)
+        elements.append(Paragraph(
+            "E-Safe Enterprises  ·  G-176 Boranada Industrial Area, Jodhpur, Rajasthan 342012  "
+            "·  GSTIN: 08AACFE4028Q1Z5",
+            footer_st,
+        ))
+
+        pdf.build(elements)
+        buffer.seek(0)
+        logger.info("Generated BOQ PDF: %s", product.get("name"))
+        return buffer

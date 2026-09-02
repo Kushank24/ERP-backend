@@ -16,8 +16,10 @@ from sqlalchemy.orm import Session
 from ..boq_math import total_quantity_consumed
 from ..db import get_db
 from ..deps import get_current_user
+from ..pdf_service import PDFGenerationService
 
 router = APIRouter(prefix="/products", tags=["products"])
+_pdf_svc = PDFGenerationService()
 
 
 class BoqLineIn(BaseModel):
@@ -505,6 +507,34 @@ def download_boq(
     return StreamingResponse(
         buf,
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@router.get("/{product_id}/boq/download-pdf")
+def download_boq_pdf(
+    product_id: int,
+    db: Session = Depends(get_db),
+    user: dict = Depends(get_current_user),
+):
+    """Download the BOQ for a product as a PDF file."""
+    _ = user
+    product = db.execute(
+        text("SELECT id, name, product_code, description, category, default_unit_price FROM products WHERE id = :id"),
+        {"id": product_id},
+    ).mappings().first()
+    if not product:
+        raise HTTPException(404, "Product not found")
+
+    boq = _load_boq(db, product_id)
+    buf = _pdf_svc.generate_boq_pdf(dict(product), boq)
+
+    safe_name = (product["name"] or "product").replace(" ", "_").replace("/", "-")
+    filename = f"BOQ_{safe_name}.pdf"
+
+    return StreamingResponse(
+        buf,
+        media_type="application/pdf",
         headers={"Content-Disposition": f'attachment; filename="{filename}"'},
     )
 

@@ -22,20 +22,43 @@ def _fmt_month(dt: datetime) -> str:
 # ─────────────────────────────────────────────────────────────────────────────
 
 @router.get("/crm")
-def crm_analytics(db: Session = Depends(get_db), _: dict = Depends(get_current_user)):
+def crm_analytics(
+    db: Session = Depends(get_db),
+    _: dict = Depends(get_current_user),
+    date_from: Optional[str] = Query(None),
+    date_to: Optional[str] = Query(None),
+):
+    # Build separate filters for enquiries (enquiry_date) and offers (offer_date)
+    enq_filter = ""
+    enq_params: dict = {}
+    if date_from:
+        enq_filter += " AND enquiry_date >= :enq_date_from"
+        enq_params["enq_date_from"] = date_from
+    if date_to:
+        enq_filter += " AND enquiry_date <= :enq_date_to"
+        enq_params["enq_date_to"] = date_to
 
-    totals_row = db.execute(text("""
+    off_filter = ""
+    off_params: dict = {}
+    if date_from:
+        off_filter += " AND offer_date >= :off_date_from"
+        off_params["off_date_from"] = date_from
+    if date_to:
+        off_filter += " AND offer_date <= :off_date_to"
+        off_params["off_date_to"] = date_to
+
+    totals_row = db.execute(text(f"""
         SELECT
-          (SELECT COUNT(*) FROM enquiries)                                 AS enquiries,
-          (SELECT COUNT(*) FROM offers)                                    AS offers,
-          (SELECT COUNT(*) FROM offers WHERE status = 'accepted')         AS accepted,
-          (SELECT COUNT(*) FROM offers WHERE status = 'rejected')         AS rejected,
-          (SELECT COUNT(*) FROM offers WHERE status = 'sent')             AS open,
-          (SELECT COUNT(*) FROM offers WHERE status = 'draft')            AS draft,
-          (SELECT COUNT(*) FROM companies)                                 AS companies
-    """)).mappings().first()
+          (SELECT COUNT(*) FROM enquiries WHERE 1=1{enq_filter})                                 AS enquiries,
+          (SELECT COUNT(*) FROM offers WHERE 1=1{off_filter})                                    AS offers,
+          (SELECT COUNT(*) FROM offers WHERE status = 'accepted'{off_filter})                    AS accepted,
+          (SELECT COUNT(*) FROM offers WHERE status = 'rejected'{off_filter})                    AS rejected,
+          (SELECT COUNT(*) FROM offers WHERE status = 'sent'{off_filter})                        AS open,
+          (SELECT COUNT(*) FROM offers WHERE status = 'draft'{off_filter})                       AS draft,
+          (SELECT COUNT(*) FROM companies)                                                        AS companies
+    """), {**enq_params, **off_params}).mappings().first()
 
-    pipeline_row = db.execute(text("""
+    pipeline_row = db.execute(text(f"""
         SELECT
           COALESCE(SUM(CASE WHEN status = 'sent'     THEN total_amount ELSE 0 END), 0) AS open_value,
           COALESCE(SUM(CASE WHEN status = 'accepted' THEN total_amount ELSE 0 END), 0) AS won_value,
@@ -48,23 +71,31 @@ def crm_analytics(db: Session = Depends(get_db), _: dict = Depends(get_current_u
             ELSE 0
           END AS win_rate_pct
         FROM offers
-    """)).mappings().first()
+        WHERE 1=1{off_filter}
+    """), off_params).mappings().first()
 
-    # Monthly activity last 13 months
-    monthly_rows = db.execute(text("""
+    # Monthly activity — use date range if provided, else last 13 months
+    if date_from or date_to:
+        off_monthly_where = f"WHERE 1=1{off_filter}"
+        enq_monthly_where = f"WHERE 1=1{enq_filter}"
+    else:
+        off_monthly_where = "WHERE offer_date >= DATE_TRUNC('month', NOW()) - INTERVAL '12 months'"
+        enq_monthly_where = "WHERE enquiry_date >= DATE_TRUNC('month', NOW()) - INTERVAL '12 months'"
+
+    monthly_rows = db.execute(text(f"""
         WITH months AS (
           SELECT DATE_TRUNC('month', offer_date)                                                 AS mo,
                  COUNT(*)                                                                        AS offers,
                  COUNT(*) FILTER (WHERE status = 'accepted')                                    AS won,
                  COALESCE(SUM(CASE WHEN status = 'accepted' THEN total_amount ELSE 0 END), 0)   AS won_value
           FROM offers
-          WHERE offer_date >= DATE_TRUNC('month', NOW()) - INTERVAL '12 months'
+          {off_monthly_where}
           GROUP BY mo
         ),
         enq_months AS (
           SELECT DATE_TRUNC('month', enquiry_date) AS mo, COUNT(*) AS enquiries
           FROM enquiries
-          WHERE enquiry_date >= DATE_TRUNC('month', NOW()) - INTERVAL '12 months'
+          {enq_monthly_where}
           GROUP BY mo
         )
         SELECT
@@ -76,7 +107,7 @@ def crm_analytics(db: Session = Depends(get_db), _: dict = Depends(get_current_u
         FROM months m
         FULL OUTER JOIN enq_months e ON e.mo = m.mo
         ORDER BY mo ASC
-    """)).mappings().all()
+    """), {**enq_params, **off_params}).mappings().all()
 
     monthly = []
     for r in monthly_rows:
@@ -118,18 +149,36 @@ def crm_analytics(db: Session = Depends(get_db), _: dict = Depends(get_current_u
 # ─────────────────────────────────────────────────────────────────────────────
 
 @router.get("/companies")
-def list_companies_summary(db: Session = Depends(get_db), _: dict = Depends(get_current_user)):
-    rows = db.execute(text("""
+def list_companies_summary(
+    db: Session = Depends(get_db),
+    _: dict = Depends(get_current_user),
+    date_from: Optional[str] = Query(None),
+    date_to: Optional[str] = Query(None),
+):
+    # Apply date filters to JOIN conditions so counts reflect the period
+    enq_join_filter = ""
+    off_join_filter = ""
+    params: dict = {}
+    if date_from:
+        enq_join_filter += " AND e.enquiry_date >= :date_from"
+        off_join_filter += " AND o.offer_date >= :date_from"
+        params["date_from"] = date_from
+    if date_to:
+        enq_join_filter += " AND e.enquiry_date <= :date_to"
+        off_join_filter += " AND o.offer_date <= :date_to"
+        params["date_to"] = date_to
+
+    rows = db.execute(text(f"""
         SELECT c.id, c.name,
                COUNT(DISTINCT e.id)  AS enquiry_count,
                COUNT(DISTINCT o.id)  AS offer_count,
                COALESCE(MAX(e.enquiry_date), MAX(o.offer_date)) AS last_activity
         FROM companies c
-        LEFT JOIN enquiries e ON e.company_id = c.id
-        LEFT JOIN offers    o ON o.company_id = c.id
+        LEFT JOIN enquiries e ON e.company_id = c.id{enq_join_filter}
+        LEFT JOIN offers    o ON o.company_id = c.id{off_join_filter}
         GROUP BY c.id, c.name
         ORDER BY last_activity DESC NULLS LAST, c.name
-    """)).mappings().all()
+    """), params).mappings().all()
 
     return [
         {
@@ -152,6 +201,8 @@ def company_analytics(
     company_id: int,
     db: Session = Depends(get_db),
     _: dict = Depends(get_current_user),
+    date_from: Optional[str] = Query(None),
+    date_to: Optional[str] = Query(None),
 ):
     company = db.execute(
         text("SELECT id, name, contact_person, phone, email, gstin FROM companies WHERE id = :id"),
@@ -160,20 +211,33 @@ def company_analytics(
     if not company:
         raise HTTPException(404, "Company not found")
 
+    # Build date filters
+    enq_filter = ""
+    off_filter = ""
+    date_params: dict = {}
+    if date_from:
+        enq_filter += " AND enquiry_date >= :date_from"
+        off_filter += " AND offer_date >= :date_from"
+        date_params["date_from"] = date_from
+    if date_to:
+        enq_filter += " AND enquiry_date <= :date_to"
+        off_filter += " AND offer_date <= :date_to"
+        date_params["date_to"] = date_to
+
     # Enquiry timeline
-    enquiry_rows = db.execute(text("""
+    enquiry_rows = db.execute(text(f"""
         SELECT id, enquiry_number, enquiry_date, status, priority, reference_number, notes
-        FROM enquiries WHERE company_id = :id
+        FROM enquiries WHERE company_id = :id{enq_filter}
         ORDER BY enquiry_date DESC
-    """), {"id": company_id}).mappings().all()
+    """), {"id": company_id, **date_params}).mappings().all()
 
     # Offer timeline with items
-    offer_rows = db.execute(text("""
+    offer_rows = db.execute(text(f"""
         SELECT o.id, o.offer_number, o.offer_date, o.status, o.total_amount,
                o.follow_up_comments, o.enquiry_id
-        FROM offers o WHERE o.company_id = :id
+        FROM offers o WHERE o.company_id = :id{off_filter}
         ORDER BY o.offer_date DESC
-    """), {"id": company_id}).mappings().all()
+    """), {"id": company_id, **date_params}).mappings().all()
 
     offer_ids = [r["id"] for r in offer_rows]
 
@@ -234,12 +298,18 @@ def company_analytics(
         key=lambda x: x["quantity"], reverse=True
     )[:10]
 
-    # Monthly trend (last 24 months)
-    trend_rows = db.execute(text("""
+    # Monthly trend — use supplied date range or fall back to last 24 months
+    if date_from or date_to:
+        enq_trend_filter = enq_filter
+        off_trend_filter = off_filter
+    else:
+        enq_trend_filter = " AND enquiry_date >= NOW() - INTERVAL '24 months'"
+        off_trend_filter = " AND offer_date >= NOW() - INTERVAL '24 months'"
+
+    trend_rows = db.execute(text(f"""
         WITH e_mo AS (
           SELECT DATE_TRUNC('month', enquiry_date) AS mo, COUNT(*) AS cnt
-          FROM enquiries WHERE company_id = :id
-            AND enquiry_date >= NOW() - INTERVAL '24 months'
+          FROM enquiries WHERE company_id = :id{enq_trend_filter}
           GROUP BY mo
         ),
         o_mo AS (
@@ -247,8 +317,7 @@ def company_analytics(
                  COUNT(*) AS cnt,
                  COUNT(*) FILTER (WHERE status = 'accepted') AS won,
                  COALESCE(SUM(CASE WHEN status='accepted' THEN total_amount ELSE 0 END),0) AS won_val
-          FROM offers WHERE company_id = :id
-            AND offer_date >= NOW() - INTERVAL '24 months'
+          FROM offers WHERE company_id = :id{off_trend_filter}
           GROUP BY mo
         )
         SELECT COALESCE(e.mo, o.mo) AS mo,
@@ -259,7 +328,7 @@ def company_analytics(
         FROM e_mo e
         FULL OUTER JOIN o_mo o ON o.mo = e.mo
         ORDER BY mo ASC
-    """), {"id": company_id}).mappings().all()
+    """), {"id": company_id, **date_params}).mappings().all()
 
     monthly_trend = []
     for r in trend_rows:
@@ -311,12 +380,27 @@ def company_analytics(
 # ─────────────────────────────────────────────────────────────────────────────
 
 @router.get("/production")
-def production_analytics(db: Session = Depends(get_db), _: dict = Depends(get_current_user)):
+def production_analytics(
+    db: Session = Depends(get_db),
+    _: dict = Depends(get_current_user),
+    date_from: Optional[str] = Query(None),
+    date_to: Optional[str] = Query(None),
+):
+    date_filter = ""
+    date_params: dict = {}
+    if date_from:
+        date_filter += " AND creation_date >= :date_from"
+        date_params["date_from"] = date_from
+    if date_to:
+        date_filter += " AND creation_date <= :date_to"
+        date_params["date_to"] = date_to
 
     # Work order counts by status
-    wo_rows = db.execute(text("""
-        SELECT status, COUNT(*) AS cnt FROM work_orders GROUP BY status
-    """)).mappings().all()
+    wo_rows = db.execute(text(f"""
+        SELECT status, COUNT(*) AS cnt FROM work_orders
+        WHERE 1=1{date_filter}
+        GROUP BY status
+    """), date_params).mappings().all()
 
     wo_by_status: dict[str, int] = {r["status"]: int(r["cnt"] or 0) for r in wo_rows}
     total_wo    = sum(wo_by_status.values())
@@ -327,14 +411,15 @@ def production_analytics(db: Session = Depends(get_db), _: dict = Depends(get_cu
     completion_rate = round(100.0 * completed / total_wo, 1) if total_wo else 0.0
 
     # WO delivery performance (overdue = delivery_date < today AND not completed)
-    perf_row = db.execute(text("""
+    perf_row = db.execute(text(f"""
         SELECT
           COUNT(*) FILTER (WHERE delivery_date < CURRENT_DATE AND status != 'completed') AS overdue,
           COUNT(*) FILTER (WHERE delivery_date IS NOT NULL)                               AS with_deadline
         FROM work_orders
-    """)).mappings().first()
+        WHERE 1=1{date_filter}
+    """), date_params).mappings().first()
 
-    # Inventory health
+    # Inventory health — current state, no date filter
     inv_row = db.execute(text("""
         SELECT
           COUNT(*)                                                            AS total_materials,
@@ -345,16 +430,21 @@ def production_analytics(db: Session = Depends(get_db), _: dict = Depends(get_cu
         FROM materials
     """)).mappings().first()
 
-    # Monthly work orders (last 13 months) — uses creation_date
-    monthly_wo_rows = db.execute(text("""
+    # Monthly work orders — use date range if provided, else last 13 months
+    if date_from or date_to:
+        monthly_wo_where = f"WHERE 1=1{date_filter}"
+    else:
+        monthly_wo_where = "WHERE creation_date >= DATE_TRUNC('month', NOW()) - INTERVAL '12 months'"
+
+    monthly_wo_rows = db.execute(text(f"""
         SELECT DATE_TRUNC('month', creation_date)                             AS mo,
                COUNT(*)                                                       AS cnt,
                COUNT(*) FILTER (WHERE status = 'completed')                  AS done
         FROM work_orders
-        WHERE creation_date >= DATE_TRUNC('month', NOW()) - INTERVAL '12 months'
+        {monthly_wo_where}
         GROUP BY mo
         ORDER BY mo ASC
-    """)).mappings().all()
+    """), date_params).mappings().all()
 
     monthly_wo = []
     for r in monthly_wo_rows:
@@ -370,7 +460,7 @@ def production_analytics(db: Session = Depends(get_db), _: dict = Depends(get_cu
         })
 
     # Top external clients
-    top_clients_rows = db.execute(text("""
+    top_clients_rows = db.execute(text(f"""
         SELECT party_name AS name, COUNT(*) AS count,
                COUNT(*) FILTER (WHERE status = 'completed') AS completed
         FROM work_orders
@@ -378,10 +468,11 @@ def production_analytics(db: Session = Depends(get_db), _: dict = Depends(get_cu
           AND LOWER(party_name) NOT LIKE '%e-safe%'
           AND LOWER(party_name) NOT LIKE '%e safe%'
           AND LOWER(party_name) NOT LIKE '%esafe%'
+          {date_filter}
         GROUP BY party_name
         ORDER BY count DESC
         LIMIT 10
-    """)).mappings().all()
+    """), date_params).mappings().all()
 
     top_clients = [
         {
@@ -392,7 +483,7 @@ def production_analytics(db: Session = Depends(get_db), _: dict = Depends(get_cu
         for r in top_clients_rows
     ]
 
-    # Top materials by value
+    # Top materials by value — current inventory state, no date filter
     top_materials_rows = db.execute(text("""
         SELECT name,
                COALESCE(length_weight_nos * per_unit_cost, 0) AS value,
@@ -413,7 +504,7 @@ def production_analytics(db: Session = Depends(get_db), _: dict = Depends(get_cu
         for r in top_materials_rows
     ]
 
-    # Monthly material additions (last 13 months)
+    # Monthly material additions (last 13 months) — uses created_at, keep as-is
     mat_monthly_rows = db.execute(text("""
         SELECT DATE_TRUNC('month', created_at) AS mo, COUNT(*) AS cnt
         FROM materials
@@ -460,8 +551,22 @@ def production_analytics(db: Session = Depends(get_db), _: dict = Depends(get_cu
 # ─────────────────────────────────────────────────────────────────────────────
 
 @router.get("/production/clients")
-def list_production_clients(db: Session = Depends(get_db), _: dict = Depends(get_current_user)):
-    rows = db.execute(text("""
+def list_production_clients(
+    db: Session = Depends(get_db),
+    _: dict = Depends(get_current_user),
+    date_from: Optional[str] = Query(None),
+    date_to: Optional[str] = Query(None),
+):
+    date_filter = ""
+    date_params: dict = {}
+    if date_from:
+        date_filter += " AND creation_date >= :date_from"
+        date_params["date_from"] = date_from
+    if date_to:
+        date_filter += " AND creation_date <= :date_to"
+        date_params["date_to"] = date_to
+
+    rows = db.execute(text(f"""
         SELECT party_name AS name,
                COUNT(*)                                               AS total,
                COUNT(*) FILTER (WHERE status = 'completed')          AS completed,
@@ -472,9 +577,10 @@ def list_production_clients(db: Session = Depends(get_db), _: dict = Depends(get
           AND LOWER(party_name) NOT LIKE '%e-safe%'
           AND LOWER(party_name) NOT LIKE '%e safe%'
           AND LOWER(party_name) NOT LIKE '%esafe%'
+          {date_filter}
         GROUP BY party_name
         ORDER BY last_wo DESC NULLS LAST, total DESC
-    """)).mappings().all()
+    """), date_params).mappings().all()
 
     return [
         {
@@ -497,14 +603,25 @@ def production_client_analytics(
     name: str = Query(..., description="party_name to analyse"),
     db: Session = Depends(get_db),
     _: dict = Depends(get_current_user),
+    date_from: Optional[str] = Query(None),
+    date_to: Optional[str] = Query(None),
 ):
+    date_filter = ""
+    date_params: dict = {}
+    if date_from:
+        date_filter += " AND creation_date >= :date_from"
+        date_params["date_from"] = date_from
+    if date_to:
+        date_filter += " AND creation_date <= :date_to"
+        date_params["date_to"] = date_to
+
     # Work orders for this client
-    wo_rows = db.execute(text("""
+    wo_rows = db.execute(text(f"""
         SELECT id, work_order_number, po_number, creation_date, delivery_date, status, remarks
         FROM work_orders
-        WHERE party_name = :name
+        WHERE party_name = :name{date_filter}
         ORDER BY creation_date DESC
-    """), {"name": name}).mappings().all()
+    """), {"name": name, **date_params}).mappings().all()
 
     if not wo_rows:
         raise HTTPException(404, "No work orders found for this client")
@@ -560,16 +677,20 @@ def production_client_analytics(
         key=lambda x: x["quantity"], reverse=True
     )[:10]
 
-    # Monthly trend (last 24 months)
-    trend_rows = db.execute(text("""
+    # Monthly trend — use supplied date range or fall back to last 24 months
+    if date_from or date_to:
+        trend_date_filter = date_filter
+    else:
+        trend_date_filter = " AND creation_date >= NOW() - INTERVAL '24 months'"
+
+    trend_rows = db.execute(text(f"""
         SELECT DATE_TRUNC('month', creation_date)                      AS mo,
                COUNT(*)                                                AS total,
                COUNT(*) FILTER (WHERE status = 'completed')           AS completed
         FROM work_orders
-        WHERE party_name = :name
-          AND creation_date >= NOW() - INTERVAL '24 months'
+        WHERE party_name = :name{trend_date_filter}
         GROUP BY mo ORDER BY mo ASC
-    """), {"name": name}).mappings().all()
+    """), {"name": name, **date_params}).mappings().all()
 
     monthly_trend = []
     for r in trend_rows:
@@ -603,9 +724,22 @@ def production_client_analytics(
 # ─────────────────────────────────────────────────────────────────────────────
 
 @router.get("/po")
-def po_analytics(db: Session = Depends(get_db), _: dict = Depends(get_current_user)):
+def po_analytics(
+    db: Session = Depends(get_db),
+    _: dict = Depends(get_current_user),
+    date_from: Optional[str] = Query(None),
+    date_to: Optional[str] = Query(None),
+):
+    date_filter = ""
+    date_params: dict = {}
+    if date_from:
+        date_filter += " AND purchase_date >= :date_from"
+        date_params["date_from"] = date_from
+    if date_to:
+        date_filter += " AND purchase_date <= :date_to"
+        date_params["date_to"] = date_to
 
-    totals_row = db.execute(text("""
+    totals_row = db.execute(text(f"""
         SELECT
           COUNT(*)                                                                   AS total,
           COALESCE(SUM(total_amount), 0)                                             AS total_value,
@@ -618,18 +752,24 @@ def po_analytics(db: Session = Depends(get_db), _: dict = Depends(get_current_us
             WHERE order_delivery_date < CURRENT_DATE AND status NOT IN (4, 5)
           )                                                                           AS overdue
         FROM purchase_orders
-    """)).mappings().first()
+        WHERE 1=1{date_filter}
+    """), date_params).mappings().first()
 
-    # Monthly POs last 13 months
-    monthly_rows = db.execute(text("""
+    # Monthly POs — use date range if provided, else last 13 months
+    if date_from or date_to:
+        monthly_where = f"WHERE 1=1{date_filter}"
+    else:
+        monthly_where = "WHERE purchase_date >= DATE_TRUNC('month', NOW()) - INTERVAL '12 months'"
+
+    monthly_rows = db.execute(text(f"""
         SELECT DATE_TRUNC('month', purchase_date) AS mo,
                COUNT(*)                           AS cnt,
                COALESCE(SUM(total_amount), 0)     AS value
         FROM purchase_orders
-        WHERE purchase_date >= DATE_TRUNC('month', NOW()) - INTERVAL '12 months'
+        {monthly_where}
         GROUP BY mo
         ORDER BY mo ASC
-    """)).mappings().all()
+    """), date_params).mappings().all()
 
     monthly = []
     for r in monthly_rows:
@@ -645,14 +785,15 @@ def po_analytics(db: Session = Depends(get_db), _: dict = Depends(get_current_us
         })
 
     # Top 10 suppliers by total PO value
-    top_suppliers_rows = db.execute(text("""
+    top_suppliers_rows = db.execute(text(f"""
         SELECT s.name, COALESCE(SUM(p.total_amount), 0) AS total_amount
         FROM purchase_orders p
         JOIN suppliers s ON s.id = p.supplier_id
+        WHERE 1=1{date_filter}
         GROUP BY s.name
         ORDER BY total_amount DESC
         LIMIT 10
-    """)).mappings().all()
+    """), date_params).mappings().all()
 
     top_suppliers = [
         {"name": r["name"], "total_amount": float(r["total_amount"] or 0)}
@@ -660,9 +801,11 @@ def po_analytics(db: Session = Depends(get_db), _: dict = Depends(get_current_us
     ]
 
     # Status breakdown
-    status_rows = db.execute(text("""
-        SELECT status, COUNT(*) AS cnt FROM purchase_orders GROUP BY status ORDER BY status
-    """)).mappings().all()
+    status_rows = db.execute(text(f"""
+        SELECT status, COUNT(*) AS cnt FROM purchase_orders
+        WHERE 1=1{date_filter}
+        GROUP BY status ORDER BY status
+    """), date_params).mappings().all()
 
     status_breakdown = [
         {"status": int(r["status"] or 0), "count": int(r["cnt"] or 0)}
@@ -847,9 +990,22 @@ def po_supplier_analytics(
 # ─────────────────────────────────────────────────────────────────────────────
 
 @router.get("/so")
-def so_analytics(db: Session = Depends(get_db), _: dict = Depends(get_current_user)):
+def so_analytics(
+    db: Session = Depends(get_db),
+    _: dict = Depends(get_current_user),
+    date_from: Optional[str] = Query(None),
+    date_to: Optional[str] = Query(None),
+):
+    date_filter = ""
+    date_params: dict = {}
+    if date_from:
+        date_filter += " AND sales_date >= :date_from"
+        date_params["date_from"] = date_from
+    if date_to:
+        date_filter += " AND sales_date <= :date_to"
+        date_params["date_to"] = date_to
 
-    totals_row = db.execute(text("""
+    totals_row = db.execute(text(f"""
         SELECT
           COUNT(*)                                                                       AS total,
           COALESCE(SUM(total_amount), 0)                                                 AS total_revenue,
@@ -867,19 +1023,25 @@ def so_analytics(db: Session = Depends(get_db), _: dict = Depends(get_current_us
             ELSE 0
           END                                                                             AS payment_collection_rate
         FROM sales_orders
-    """)).mappings().first()
+        WHERE 1=1{date_filter}
+    """), date_params).mappings().first()
 
-    # Monthly SOs last 13 months
-    monthly_rows = db.execute(text("""
+    # Monthly SOs — use date range if provided, else last 13 months
+    if date_from or date_to:
+        monthly_where = f"WHERE 1=1{date_filter}"
+    else:
+        monthly_where = "WHERE sales_date >= DATE_TRUNC('month', NOW()) - INTERVAL '12 months'"
+
+    monthly_rows = db.execute(text(f"""
         SELECT DATE_TRUNC('month', sales_date)                                     AS mo,
                COUNT(*)                                                            AS cnt,
                COALESCE(SUM(total_amount), 0)                                      AS value,
                COALESCE(SUM(payment_amount) FILTER (WHERE payment_amount IS NOT NULL), 0) AS payment
         FROM sales_orders
-        WHERE sales_date >= DATE_TRUNC('month', NOW()) - INTERVAL '12 months'
+        {monthly_where}
         GROUP BY mo
         ORDER BY mo ASC
-    """)).mappings().all()
+    """), date_params).mappings().all()
 
     monthly = []
     for r in monthly_rows:
@@ -896,13 +1058,14 @@ def so_analytics(db: Session = Depends(get_db), _: dict = Depends(get_current_us
         })
 
     # Top 10 customers by total_amount
-    top_customers_rows = db.execute(text("""
+    top_customers_rows = db.execute(text(f"""
         SELECT company_name, COALESCE(SUM(total_amount), 0) AS total_amount
         FROM sales_orders
+        WHERE 1=1{date_filter}
         GROUP BY company_name
         ORDER BY total_amount DESC
         LIMIT 10
-    """)).mappings().all()
+    """), date_params).mappings().all()
 
     top_customers = [
         {"company_name": r["company_name"], "total_amount": float(r["total_amount"] or 0)}

@@ -519,7 +519,7 @@ class PDFGenerationService:
     # Public: Offer / Quotation PDF  (E-Safe format)
     # ------------------------------------------------------------------
 
-    def generate_offer_pdf(self, data: dict[str, Any]) -> io.BytesIO:
+    def generate_offer_pdf(self, data: dict[str, Any], variant: str = "normal") -> io.BytesIO:
         from reportlab.lib.pagesizes import A4
         from reportlab.lib.enums import TA_LEFT, TA_CENTER, TA_JUSTIFY
         from datetime import date as _date
@@ -653,6 +653,8 @@ class PDFGenerationService:
         }
         sym = _sym_map.get(currency, currency)
 
+        is_tender = (variant == "tender")
+
         # ── items table ───────────────────────────────────────────────
         items = data.get("items") or []
         rows: list = [[
@@ -686,78 +688,105 @@ class PDFGenerationService:
                         f"<br/>• {escape(str(s.get('spec_name') or ''))}: "
                         f"{escape(str(s.get('value')))}"
                     )
+            # Tender mode: hide actual prices, show "Offered"
+            rate_cell = "Offered" if is_tender else f"{sym} {up:,.2f}"
+            total_cell = "Offered" if is_tender else f"{sym} {tp:,.2f}"
             rows.append([
                 str(i),
                 Paragraph(desc_html, desc_st),
                 "PC",
                 str(qty),
-                f"{sym} {up:,.2f}",
-                f"{sym} {tp:,.2f}",
+                rate_cell,
+                total_cell,
             ])
 
-        # cost breakdown rows
-        subtotal = float(data.get("subtotal") or 0)
-        packing_pct = float(data.get("packing_charges_pct") or 0)
-        freight = float(data.get("freight_charges") or 0)
-        _gst = data.get("gst_pct")
-        gst_pct = float(_gst if _gst is not None else 18)
-        packing_amt = subtotal * (packing_pct / 100)
-        assessable = subtotal + packing_amt + freight
-        gst_amt = assessable * (gst_pct / 100)
-        grand_total = assessable + gst_amt
-
         breakdown_start = len(rows)
-        rows.append(["", "Sub-Total", "", "", "", f"{sym} {subtotal:,.2f}"])
-        if packing_pct > 0:
-            rows.append(["", f"Packing Charges ({packing_pct:.0f}%)", "", "", "", f"{sym} {packing_amt:,.2f}"])
-        if freight > 0:
-            rows.append(["", "Freight Charges", "", "", "", f"{sym} {freight:,.2f}"])
-        if packing_pct > 0 or freight > 0:
-            rows.append(["", "Assessable Value", "", "", "", f"{sym} {assessable:,.2f}"])
-        if gst_pct > 0:
-            rows.append(["", f"IGST ({gst_pct:.0f}%)", "", "", "", f"{sym} {gst_amt:,.2f}"])
-        rows.append(["", "GRAND TOTAL", "", "", "", f"{sym} {grand_total:,.2f}"])
-        total_row = len(rows) - 1
+
+        if not is_tender:
+            # cost breakdown rows (normal offer only)
+            subtotal = float(data.get("subtotal") or 0)
+            packing_pct = float(data.get("packing_charges_pct") or 0)
+            freight = float(data.get("freight_charges") or 0)
+            _gst = data.get("gst_pct")
+            gst_pct = float(_gst if _gst is not None else 18)
+            packing_amt = subtotal * (packing_pct / 100)
+            assessable = subtotal + packing_amt + freight
+            gst_amt = assessable * (gst_pct / 100)
+            grand_total = assessable + gst_amt
+
+            rows.append(["", "Sub-Total", "", "", "", f"{sym} {subtotal:,.2f}"])
+            if packing_pct > 0:
+                rows.append(["", f"Packing Charges ({packing_pct:.0f}%)", "", "", "", f"{sym} {packing_amt:,.2f}"])
+            if freight > 0:
+                rows.append(["", "Freight Charges", "", "", "", f"{sym} {freight:,.2f}"])
+            if packing_pct > 0 or freight > 0:
+                rows.append(["", "Assessable Value", "", "", "", f"{sym} {assessable:,.2f}"])
+            if gst_pct > 0:
+                rows.append(["", f"IGST ({gst_pct:.0f}%)", "", "", "", f"{sym} {gst_amt:,.2f}"])
+            rows.append(["", "GRAND TOTAL", "", "", "", f"{sym} {grand_total:,.2f}"])
+            total_row = len(rows) - 1
 
         col_widths = [0.5 * inch, 4.0 * inch, 0.6 * inch, 0.6 * inch, 1.0 * inch, 1.0 * inch]
         item_tbl = Table(rows, colWidths=col_widths, repeatRows=1)
 
-        tbl_style = [
-            ("GRID", (0, 0), (-1, -1), 1, colors.darkblue),
-            ("VALIGN", (0, 0), (-1, 0), "MIDDLE"),
-            ("VALIGN", (0, 1), (-1, breakdown_start - 1), "TOP"),
-            # Header row
-            ("BACKGROUND", (0, 0), (-1, 0), colors.lightblue),
-            ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
-            ("FONTSIZE", (0, 0), (-1, 0), 9),
-            ("ALIGN", (0, 0), (-1, 0), "CENTER"),
-            ("TOPPADDING", (0, 0), (-1, 0), 3),
-            ("BOTTOMPADDING", (0, 0), (-1, 0), 3),
-            # Product rows
-            ("FONTSIZE", (0, 1), (-1, breakdown_start - 1), 9),
-            ("ALIGN", (0, 1), (0, breakdown_start - 1), "CENTER"),   # SN
-            ("ALIGN", (1, 1), (1, breakdown_start - 1), "LEFT"),      # Description
-            ("ALIGN", (2, 1), (2, breakdown_start - 1), "CENTER"),   # Unit
-            ("ALIGN", (3, 1), (3, breakdown_start - 1), "CENTER"),   # Qty
-            ("ALIGN", (4, 1), (4, breakdown_start - 1), "RIGHT"),    # Rate
-            ("ALIGN", (5, 1), (5, breakdown_start - 1), "RIGHT"),    # Total
-            ("TOPPADDING", (0, 1), (-1, breakdown_start - 1), 2),
-            ("BOTTOMPADDING", (0, 1), (-1, breakdown_start - 1), 2),
-            # Breakdown rows
-            ("FONTSIZE", (0, breakdown_start), (-1, -1), 9),
-            ("FONTNAME", (1, breakdown_start), (1, -1), "Helvetica-Bold"),
-            ("ALIGN", (1, breakdown_start), (1, -1), "CENTER"),
-            ("ALIGN", (5, breakdown_start), (5, -1), "RIGHT"),
-            ("TOPPADDING", (0, breakdown_start), (-1, -1), 2),
-            ("BOTTOMPADDING", (0, breakdown_start), (-1, -1), 2),
-            # Grand Total row
-            ("BACKGROUND", (0, total_row), (-1, total_row), colors.darkblue),
-            ("TEXTCOLOR", (0, total_row), (-1, total_row), colors.white),
-            ("FONTNAME", (0, total_row), (-1, total_row), "Helvetica-Bold"),
-            ("FONTSIZE", (0, total_row), (-1, total_row), 10),
-        ]
-        for r in range(breakdown_start, len(rows)):
-            tbl_style.append(("SPAN", (1, r), (4, r)))
+        if is_tender:
+            tbl_style = [
+                ("GRID", (0, 0), (-1, -1), 1, colors.darkblue),
+                ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+                ("VALIGN", (0, 1), (-1, -1), "TOP"),
+                ("BACKGROUND", (0, 0), (-1, 0), colors.lightblue),
+                ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+                ("FONTSIZE", (0, 0), (-1, 0), 9),
+                ("ALIGN", (0, 0), (-1, 0), "CENTER"),
+                ("TOPPADDING", (0, 0), (-1, 0), 3),
+                ("BOTTOMPADDING", (0, 0), (-1, 0), 3),
+                ("FONTSIZE", (0, 1), (-1, -1), 9),
+                ("ALIGN", (0, 1), (0, -1), "CENTER"),
+                ("ALIGN", (1, 1), (1, -1), "LEFT"),
+                ("ALIGN", (2, 1), (2, -1), "CENTER"),
+                ("ALIGN", (3, 1), (3, -1), "CENTER"),
+                ("ALIGN", (4, 1), (4, -1), "CENTER"),
+                ("ALIGN", (5, 1), (5, -1), "CENTER"),
+                ("TOPPADDING", (0, 1), (-1, -1), 2),
+                ("BOTTOMPADDING", (0, 1), (-1, -1), 2),
+            ]
+        else:
+            tbl_style = [
+                ("GRID", (0, 0), (-1, -1), 1, colors.darkblue),
+                ("VALIGN", (0, 0), (-1, 0), "MIDDLE"),
+                ("VALIGN", (0, 1), (-1, breakdown_start - 1), "TOP"),
+                # Header row
+                ("BACKGROUND", (0, 0), (-1, 0), colors.lightblue),
+                ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+                ("FONTSIZE", (0, 0), (-1, 0), 9),
+                ("ALIGN", (0, 0), (-1, 0), "CENTER"),
+                ("TOPPADDING", (0, 0), (-1, 0), 3),
+                ("BOTTOMPADDING", (0, 0), (-1, 0), 3),
+                # Product rows
+                ("FONTSIZE", (0, 1), (-1, breakdown_start - 1), 9),
+                ("ALIGN", (0, 1), (0, breakdown_start - 1), "CENTER"),
+                ("ALIGN", (1, 1), (1, breakdown_start - 1), "LEFT"),
+                ("ALIGN", (2, 1), (2, breakdown_start - 1), "CENTER"),
+                ("ALIGN", (3, 1), (3, breakdown_start - 1), "CENTER"),
+                ("ALIGN", (4, 1), (4, breakdown_start - 1), "RIGHT"),
+                ("ALIGN", (5, 1), (5, breakdown_start - 1), "RIGHT"),
+                ("TOPPADDING", (0, 1), (-1, breakdown_start - 1), 2),
+                ("BOTTOMPADDING", (0, 1), (-1, breakdown_start - 1), 2),
+                # Breakdown rows
+                ("FONTSIZE", (0, breakdown_start), (-1, -1), 9),
+                ("FONTNAME", (1, breakdown_start), (1, -1), "Helvetica-Bold"),
+                ("ALIGN", (1, breakdown_start), (1, -1), "CENTER"),
+                ("ALIGN", (5, breakdown_start), (5, -1), "RIGHT"),
+                ("TOPPADDING", (0, breakdown_start), (-1, -1), 2),
+                ("BOTTOMPADDING", (0, breakdown_start), (-1, -1), 2),
+                # Grand Total row
+                ("BACKGROUND", (0, total_row), (-1, total_row), colors.darkblue),
+                ("TEXTCOLOR", (0, total_row), (-1, total_row), colors.white),
+                ("FONTNAME", (0, total_row), (-1, total_row), "Helvetica-Bold"),
+                ("FONTSIZE", (0, total_row), (-1, total_row), 10),
+            ]
+            for r in range(breakdown_start, len(rows)):
+                tbl_style.append(("SPAN", (1, r), (4, r)))
 
         item_tbl.setStyle(TableStyle(tbl_style))
         elements.append(item_tbl)

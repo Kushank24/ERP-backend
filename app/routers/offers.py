@@ -4,7 +4,7 @@ import io
 from datetime import date
 from typing import List, Optional
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import text
@@ -357,16 +357,18 @@ def delete_offer(
 @router.get("/{offer_id}/pdf")
 def download_offer_pdf(
     offer_id: int,
+    variant: str = Query("normal", pattern="^(normal|tender)$"),
     db: Session = Depends(get_db),
     _user: dict = Depends(get_current_user),
 ):
     offer = _serialize(db, offer_id)
-    pdf_bytes = _pdf_svc.generate_offer_pdf(offer)
+    pdf_bytes = _pdf_svc.generate_offer_pdf(offer, variant=variant)
     safe_num = offer["offer_number"].replace("/", "-")
+    suffix = "-Tender" if variant == "tender" else ""
     return StreamingResponse(
         io.BytesIO(pdf_bytes.getvalue()),
         media_type="application/pdf",
-        headers={"Content-Disposition": f'attachment; filename="Offer-{safe_num}.pdf"'},
+        headers={"Content-Disposition": f'attachment; filename="Offer-{safe_num}{suffix}.pdf"'},
     )
 
 

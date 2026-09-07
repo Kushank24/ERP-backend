@@ -12,6 +12,7 @@ from sqlalchemy.orm import Session
 from ..db import get_db
 from ..deps import get_current_user
 from ..pdf_service import PDFGenerationService
+from ..unit_conversion import convert_qty
 
 _pdf_svc = PDFGenerationService()
 
@@ -336,7 +337,7 @@ def patch_status(
             boq_lines = db.execute(
                 text(
                     """
-                    SELECT b.name, b.total_quantity_consumed 
+                    SELECT b.name, b.units AS boq_unit, b.total_quantity_consumed
                     FROM bill_of_quantities b
                     JOIN product_bill_of_quantity_relations r ON r.bill_of_quantity_id = b.id
                     WHERE r.product_id = :pid
@@ -346,10 +347,28 @@ def patch_status(
             ).mappings().all()
 
             for b in boq_lines:
-                deduction = float(b["total_quantity_consumed"]) * float(p["quantity"])
+                raw_deduction = float(b["total_quantity_consumed"]) * float(p["quantity"])
+                boq_unit = (b["boq_unit"] or "").strip()
+
+                # Look up the material's inventory unit for conversion
+                existing_mat = db.execute(
+                    text("SELECT id, unit FROM materials WHERE LOWER(TRIM(name)) = LOWER(TRIM(:mname)) LIMIT 1"),
+                    {"mname": b["name"]}
+                ).mappings().first()
+
+                if not existing_mat:
+                    continue  # material not in inventory — nothing to deduct
+
+                inv_unit = (existing_mat["unit"] or "").strip()
+                converted = convert_qty(raw_deduction, boq_unit, inv_unit)
+                deduction = converted if converted is not None else raw_deduction
+
                 db.execute(
-                    text("UPDATE materials SET length_weight_nos = length_weight_nos - :deduct WHERE name = :mname"),
-                    {"deduct": deduction, "mname": b["name"]}
+                    text(
+                        "UPDATE materials SET length_weight_nos = length_weight_nos - :deduct "
+                        "WHERE id = :mid"
+                    ),
+                    {"deduct": deduction, "mid": existing_mat["id"]}
                 )
 
             # Insert into finished goods

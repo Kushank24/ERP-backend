@@ -18,7 +18,7 @@ import pytest
 # ---------------------------------------------------------------------------
 # Import the function under test directly (no DB connection needed)
 # ---------------------------------------------------------------------------
-from app.routers.purchase_orders import _convert_qty
+from app.unit_conversion import convert_qty as _convert_qty
 
 
 # ===========================================================================

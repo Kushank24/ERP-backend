@@ -13,6 +13,7 @@ from sqlalchemy.orm import Session
 from ..db import get_db
 from ..deps import get_current_user
 from ..pdf_service import PDFGenerationService
+from ..unit_conversion import convert_qty as _convert_qty
 
 _pdf_svc = PDFGenerationService()
 
@@ -360,19 +361,28 @@ def patch_po_status(
             pending_qty = total_qty - del_qty
 
             if pending_qty > 0:
-                # Add to inventory — case-insensitive match so "Widget A" and "widget a" merge
-                updated = db.execute(
-                    text(
-                        "UPDATE materials SET length_weight_nos = length_weight_nos + :qty, "
-                        "per_unit_cost = :cost, updated_at = now() "
-                        "WHERE LOWER(TRIM(name)) = LOWER(TRIM(:name)) RETURNING id"
-                    ),
-                    {"qty": pending_qty, "name": mat_name, "cost": float(line["per_unit_cost"])}
-                ).first()
-                if not updated:
+                po_unit = (line["unit"] or "").strip()
+                # Look up existing material unit to apply conversion if needed
+                existing_mat = db.execute(
+                    text("SELECT id, unit FROM materials WHERE LOWER(TRIM(name)) = LOWER(TRIM(:name)) LIMIT 1"),
+                    {"name": mat_name}
+                ).mappings().first()
+                if existing_mat:
+                    inv_unit = (existing_mat["unit"] or "").strip()
+                    converted = _convert_qty(pending_qty, po_unit, inv_unit)
+                    add_qty = converted if converted is not None else pending_qty
+                    db.execute(
+                        text(
+                            "UPDATE materials SET length_weight_nos = length_weight_nos + :qty, "
+                            "per_unit_cost = :cost, updated_at = now() "
+                            "WHERE id = :mid"
+                        ),
+                        {"qty": add_qty, "cost": float(line["per_unit_cost"]), "mid": existing_mat["id"]}
+                    )
+                else:
                     db.execute(
                         text("INSERT INTO materials (name, length_weight_nos, unit, per_unit_cost) VALUES (:name, :qty, :unit, :cost)"),
-                        {"name": mat_name, "qty": pending_qty, "unit": line["unit"] or "", "cost": float(line["per_unit_cost"])}
+                        {"name": mat_name, "qty": pending_qty, "unit": po_unit or "", "cost": float(line["per_unit_cost"])}
                     )
                 # Mark as fully delivered in lines
                 db.execute(
@@ -425,20 +435,29 @@ def receive_po_items(
 
         mat_name = line["material_name"].strip()
         receive_qty = float(item.receive_qty)
+        po_unit = (line["unit"] or "").strip()
 
-        # Update inventory — case-insensitive match so "Widget A" and "widget a" merge
-        updated = db.execute(
-            text(
-                "UPDATE materials SET length_weight_nos = length_weight_nos + :qty, "
-                "per_unit_cost = :cost, updated_at = now() "
-                "WHERE LOWER(TRIM(name)) = LOWER(TRIM(:name)) RETURNING id"
-            ),
-            {"qty": receive_qty, "name": mat_name, "cost": float(line["per_unit_cost"])}
-        ).first()
-        if not updated:
+        # Apply unit conversion if existing inventory uses a different compatible unit
+        existing_mat = db.execute(
+            text("SELECT id, unit FROM materials WHERE LOWER(TRIM(name)) = LOWER(TRIM(:name)) LIMIT 1"),
+            {"name": mat_name}
+        ).mappings().first()
+        if existing_mat:
+            inv_unit = (existing_mat["unit"] or "").strip()
+            converted = _convert_qty(receive_qty, po_unit, inv_unit)
+            add_qty = converted if converted is not None else receive_qty
+            db.execute(
+                text(
+                    "UPDATE materials SET length_weight_nos = length_weight_nos + :qty, "
+                    "per_unit_cost = :cost, updated_at = now() "
+                    "WHERE id = :mid"
+                ),
+                {"qty": add_qty, "cost": float(line["per_unit_cost"]), "mid": existing_mat["id"]}
+            )
+        else:
             db.execute(
                 text("INSERT INTO materials (name, length_weight_nos, unit, per_unit_cost) VALUES (:name, :qty, :unit, :cost)"),
-                {"name": mat_name, "qty": receive_qty, "unit": line["unit"] or "", "cost": float(line["per_unit_cost"])}
+                {"name": mat_name, "qty": receive_qty, "unit": po_unit or "", "cost": float(line["per_unit_cost"])}
             )
 
         # Update line delivered_qty

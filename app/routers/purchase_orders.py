@@ -19,6 +19,31 @@ _pdf_svc = PDFGenerationService()
 router = APIRouter(prefix="/purchase-orders", tags=["purchase-orders"])
 
 
+# ---------------------------------------------------------------------------
+# Unit conversion helpers
+# ---------------------------------------------------------------------------
+
+_LENGTH_TO_M = {
+    "meter": 1.0, "m": 1.0,
+    "feet": 0.3048, "ft": 0.3048, "foot": 0.3048,
+}
+_AREA_TO_SQM = {
+    "sq. meter": 1.0, "sq.meter": 1.0, "sqm": 1.0, "m2": 1.0, "square meter": 1.0,
+    "sq. feet": 0.092903, "sq.feet": 0.092903, "sqft": 0.092903, "square feet": 0.092903,
+}
+
+def _convert_qty(qty: float, from_unit: str, to_unit: str) -> float | None:
+    """Return qty converted from from_unit to to_unit, or None if incompatible."""
+    f, t = (from_unit or "").strip().lower(), (to_unit or "").strip().lower()
+    if f == t:
+        return qty
+    if f in _LENGTH_TO_M and t in _LENGTH_TO_M:
+        return qty * _LENGTH_TO_M[f] / _LENGTH_TO_M[t]
+    if f in _AREA_TO_SQM and t in _AREA_TO_SQM:
+        return qty * _AREA_TO_SQM[f] / _AREA_TO_SQM[t]
+    return None  # incompatible dimensions — caller decides what to do
+
+
 class PoLineIn(BaseModel):
     material_name: str = Field(min_length=1)
     length_weight_nos: float = Field(gt=0)
@@ -360,19 +385,28 @@ def patch_po_status(
             pending_qty = total_qty - del_qty
 
             if pending_qty > 0:
-                # Add to inventory — case-insensitive match so "Widget A" and "widget a" merge
-                updated = db.execute(
-                    text(
-                        "UPDATE materials SET length_weight_nos = length_weight_nos + :qty, "
-                        "per_unit_cost = :cost, updated_at = now() "
-                        "WHERE LOWER(TRIM(name)) = LOWER(TRIM(:name)) RETURNING id"
-                    ),
-                    {"qty": pending_qty, "name": mat_name, "cost": float(line["per_unit_cost"])}
-                ).first()
-                if not updated:
+                po_unit = (line["unit"] or "").strip()
+                # Look up existing material unit to apply conversion if needed
+                existing_mat = db.execute(
+                    text("SELECT id, unit FROM materials WHERE LOWER(TRIM(name)) = LOWER(TRIM(:name)) LIMIT 1"),
+                    {"name": mat_name}
+                ).mappings().first()
+                if existing_mat:
+                    inv_unit = (existing_mat["unit"] or "").strip()
+                    converted = _convert_qty(pending_qty, po_unit, inv_unit)
+                    add_qty = converted if converted is not None else pending_qty
+                    db.execute(
+                        text(
+                            "UPDATE materials SET length_weight_nos = length_weight_nos + :qty, "
+                            "per_unit_cost = :cost, updated_at = now() "
+                            "WHERE id = :mid"
+                        ),
+                        {"qty": add_qty, "cost": float(line["per_unit_cost"]), "mid": existing_mat["id"]}
+                    )
+                else:
                     db.execute(
                         text("INSERT INTO materials (name, length_weight_nos, unit, per_unit_cost) VALUES (:name, :qty, :unit, :cost)"),
-                        {"name": mat_name, "qty": pending_qty, "unit": line["unit"] or "", "cost": float(line["per_unit_cost"])}
+                        {"name": mat_name, "qty": pending_qty, "unit": po_unit or "", "cost": float(line["per_unit_cost"])}
                     )
                 # Mark as fully delivered in lines
                 db.execute(
@@ -425,20 +459,29 @@ def receive_po_items(
 
         mat_name = line["material_name"].strip()
         receive_qty = float(item.receive_qty)
+        po_unit = (line["unit"] or "").strip()
 
-        # Update inventory — case-insensitive match so "Widget A" and "widget a" merge
-        updated = db.execute(
-            text(
-                "UPDATE materials SET length_weight_nos = length_weight_nos + :qty, "
-                "per_unit_cost = :cost, updated_at = now() "
-                "WHERE LOWER(TRIM(name)) = LOWER(TRIM(:name)) RETURNING id"
-            ),
-            {"qty": receive_qty, "name": mat_name, "cost": float(line["per_unit_cost"])}
-        ).first()
-        if not updated:
+        # Apply unit conversion if existing inventory uses a different compatible unit
+        existing_mat = db.execute(
+            text("SELECT id, unit FROM materials WHERE LOWER(TRIM(name)) = LOWER(TRIM(:name)) LIMIT 1"),
+            {"name": mat_name}
+        ).mappings().first()
+        if existing_mat:
+            inv_unit = (existing_mat["unit"] or "").strip()
+            converted = _convert_qty(receive_qty, po_unit, inv_unit)
+            add_qty = converted if converted is not None else receive_qty
+            db.execute(
+                text(
+                    "UPDATE materials SET length_weight_nos = length_weight_nos + :qty, "
+                    "per_unit_cost = :cost, updated_at = now() "
+                    "WHERE id = :mid"
+                ),
+                {"qty": add_qty, "cost": float(line["per_unit_cost"]), "mid": existing_mat["id"]}
+            )
+        else:
             db.execute(
                 text("INSERT INTO materials (name, length_weight_nos, unit, per_unit_cost) VALUES (:name, :qty, :unit, :cost)"),
-                {"name": mat_name, "qty": receive_qty, "unit": line["unit"] or "", "cost": float(line["per_unit_cost"])}
+                {"name": mat_name, "qty": receive_qty, "unit": po_unit or "", "cost": float(line["per_unit_cost"])}
             )
 
         # Update line delivered_qty

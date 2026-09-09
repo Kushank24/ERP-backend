@@ -199,7 +199,8 @@ def list_offers(
     params["offset"] = offset
     rows = db.execute(
         text(f"""
-            SELECT o.*, c.name AS company_name, e.enquiry_number {base}
+            SELECT o.*, c.name AS company_name, e.enquiry_number,
+                   o.call_status, o.called_at {base}
             ORDER BY o.created_at DESC, o.id DESC
             LIMIT :limit OFFSET :offset
         """),
@@ -342,6 +343,29 @@ def update_status(
     )
     db.commit()
     return _serialize(db, offer_id)
+
+
+@router.patch("/{offer_id}/call-status")
+def update_call_status(
+    offer_id: int,
+    db: Session = Depends(get_db),
+    _user: dict = Depends(get_current_user),
+):
+    row = db.execute(
+        text("SELECT call_status FROM offers WHERE id = :id"), {"id": offer_id}
+    ).first()
+    if not row:
+        raise HTTPException(status_code=404, detail="Offer not found")
+    new_status = not row[0]
+    db.execute(
+        text(
+            "UPDATE offers SET call_status = :cs, called_at = CASE WHEN :cs THEN now() ELSE NULL END "
+            "WHERE id = :id"
+        ),
+        {"cs": new_status, "id": offer_id},
+    )
+    db.commit()
+    return {"call_status": new_status}
 
 
 @router.delete("/{offer_id}", status_code=204)

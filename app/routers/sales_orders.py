@@ -61,6 +61,7 @@ def _serialize_so(db: Session, so_id: int) -> dict:
             """
             SELECT id, invoice_number, company_name, company_location, company_contact, company_gstin,
                    sales_date, delivery_date, actual_delivery_date, total_amount, status, gst_rate,
+                   payment_status, dispatch_status,
                    delivery_details, notes, created_at, updated_at, payment_received, payment_amount,
                    COALESCE(additional_costs, '[]'::jsonb) AS additional_costs
             FROM sales_orders WHERE id = :id
@@ -112,7 +113,9 @@ def list_so(
     where = ("WHERE " + " AND ".join(conds)) if conds else ""
     rows = db.execute(
         text(f"""
-            SELECT id, invoice_number, company_name, total_amount, status, sales_date, created_at, payment_received, payment_amount
+            SELECT id, invoice_number, company_name, total_amount, status,
+                   payment_status, dispatch_status,
+                   sales_date, created_at, payment_received, payment_amount
             FROM sales_orders {where}
             ORDER BY created_at DESC NULLS LAST
         """),
@@ -162,6 +165,10 @@ def create_so(
         tp = float(line.quantity_sold) * float(line.unit_price)
         line_totals.append((tp, line.model_dump()))
 
+    # finished_goods rows this order draws stock from, so the zero-stock
+    # cleanup at the end can be scoped to them instead of running globally.
+    touched_fg_ids: set[int] = set()
+
     subtotal = sum(t for t, _ in line_totals)
     gst_amt = subtotal * (body.gst_rate / 100.0)
     total = subtotal + gst_amt
@@ -171,11 +178,12 @@ def create_so(
             """
             INSERT INTO sales_orders (
               invoice_number, company_name, company_location, company_contact, company_gstin,
-              sales_date, delivery_date, total_amount, status, gst_rate, delivery_details, notes
+              sales_date, delivery_date, total_amount, status, payment_status, dispatch_status,
+              gst_rate, delivery_details, notes
             )
             VALUES (
-              :inv, :cname, :cloc, :ccon, :gstin, :sdate, :ddate, :total, 1, :grate,
-              CAST(:details AS jsonb), :notes
+              :inv, :cname, :cloc, :ccon, :gstin, :sdate, :ddate, :total, 1, 1, :dispatch,
+              :grate, CAST(:details AS jsonb), :notes
             )
             RETURNING id
             """
@@ -189,6 +197,11 @@ def create_so(
             "sdate": body.sales_date,
             "ddate": body.delivery_date,
             "total": total,
+            # Lines below are inserted with dispatched_qty = quantity_sold and
+            # finished-goods stock is deducted immediately, so the goods have
+            # already left inventory at creation: dispatch_status = 4 (full).
+            # This mirrors the existing stock model rather than changing it.
+            "dispatch": 4,
             "grate": body.gst_rate,
             "details": json.dumps(body.delivery_details or {}),
             "notes": body.notes,
@@ -216,6 +229,7 @@ def create_so(
                 text("UPDATE finished_goods SET quantity_in_stock = quantity_in_stock - :qty WHERE id = :id"),
                 {"qty": qty_needed, "id": fgid},
             )
+            touched_fg_ids.add(int(fgid))
         else:
             pname = ld["product_name"].strip()
             fg_rows = db.execute(
@@ -241,6 +255,7 @@ def create_so(
                     text("UPDATE finished_goods SET quantity_in_stock = quantity_in_stock - :d WHERE id = :id"),
                     {"d": deduct, "id": fg["id"]},
                 )
+                touched_fg_ids.add(int(fg["id"]))
                 rem -= deduct
 
         db.execute(
@@ -265,11 +280,31 @@ def create_so(
             },
         )
 
-    db.execute(text(
-        "UPDATE sales_order_items SET finished_good_id = NULL "
-        "WHERE finished_good_id IN (SELECT id FROM finished_goods WHERE quantity_in_stock <= 0)"
-    ))
-    db.execute(text("DELETE FROM finished_goods WHERE quantity_in_stock <= 0"))
+    # Clear out finished-goods rows this order drained to zero.
+    #
+    # This used to run unscoped — `DELETE FROM finished_goods WHERE
+    # quantity_in_stock <= 0` with no reference to the order — so creating one
+    # sales order deleted every zero-stock finished-goods row in the database,
+    # including rows belonging to unrelated orders and work orders. Now limited
+    # to the rows this order actually drew from.
+    if touched_fg_ids:
+        fg_ids = sorted(touched_fg_ids)
+        db.execute(
+            text(
+                "UPDATE sales_order_items SET finished_good_id = NULL "
+                "WHERE finished_good_id = ANY(:ids) AND finished_good_id IN "
+                "(SELECT id FROM finished_goods WHERE quantity_in_stock <= 0)"
+            ),
+            {"ids": fg_ids},
+        )
+        db.execute(
+            text(
+                "DELETE FROM finished_goods "
+                "WHERE id = ANY(:ids) AND quantity_in_stock <= 0"
+            ),
+            {"ids": fg_ids},
+        )
+
     db.commit()
     return _serialize_so(db, so_id)
 
@@ -376,9 +411,23 @@ def update_payment(so_id: int, body: PaymentUpdate, db: Session = Depends(get_db
             raise HTTPException(400, f"Payment amount cannot exceed the order total of ₹{float(row.total_amount):.2f}.")
     # Clear amount when moving away from Partial
     amt = body.payment_amount if body.payment_status == 2 else None
+    # Writes payment_status (authoritative) and keeps the legacy `status`
+    # column mirrored so any reader not yet migrated keeps working. Dispatch
+    # no longer touches `status`, so the two can no longer overwrite each
+    # other. payment_received is derived here — it existed in the schema from
+    # the start but no endpoint ever wrote it.
     db.execute(
-        text("UPDATE sales_orders SET status = :st, payment_amount = :amt, updated_at = now() WHERE id = :id"),
-        {"st": body.payment_status, "amt": amt, "id": so_id}
+        text(
+            "UPDATE sales_orders SET payment_status = :st, status = :st, "
+            "payment_received = :recv, payment_amount = :amt, updated_at = now() "
+            "WHERE id = :id"
+        ),
+        {
+            "st": body.payment_status,
+            "recv": body.payment_status == 3,
+            "amt": amt,
+            "id": so_id,
+        },
     )
     db.commit()
     return _serialize_so(db, so_id)
@@ -428,7 +477,7 @@ class DispatchCreate(BaseModel):
 def dispatch_so(so_id: int, body: DispatchCreate, db: Session = Depends(get_db), user: dict = Depends(get_current_user)):
     _ = user
     po_row = db.execute(
-        text("SELECT id, status FROM sales_orders WHERE id = :id FOR UPDATE"),
+        text("SELECT id, dispatch_status FROM sales_orders WHERE id = :id FOR UPDATE"),
         {"id": so_id}
     ).mappings().first()
     if not po_row:
@@ -458,9 +507,28 @@ def dispatch_so(so_id: int, body: DispatchCreate, db: Session = Depends(get_db),
             {"qty": item.dispatch_qty, "lid": item.line_id}
         )
 
-        # Deduct from Finished Goods
+        # Deduct from Finished Goods. Every branch checks sufficiency first —
+        # without it a dispatch drove quantity_in_stock negative silently.
         qty_needed = float(item.dispatch_qty)
         if line["finished_good_id"]:
+            fg = db.execute(
+                text(
+                    "SELECT id, product_name, quantity_in_stock FROM finished_goods "
+                    "WHERE id = :id FOR UPDATE"
+                ),
+                {"id": line["finished_good_id"]},
+            ).mappings().first()
+            if not fg:
+                raise HTTPException(
+                    400,
+                    f"Finished good for '{line['product_name']}' no longer exists in stock.",
+                )
+            if float(fg["quantity_in_stock"]) < qty_needed:
+                raise HTTPException(
+                    400,
+                    f"Insufficient stock for '{fg['product_name']}': "
+                    f"available {float(fg['quantity_in_stock'])}, required {qty_needed}",
+                )
             db.execute(
                 text("UPDATE finished_goods SET quantity_in_stock = quantity_in_stock - :qty WHERE id = :id"),
                 {"qty": qty_needed, "id": line["finished_good_id"]}
@@ -474,7 +542,15 @@ def dispatch_so(so_id: int, body: DispatchCreate, db: Session = Depends(get_db),
                 ),
                 {"pname": pname}
             ).mappings().all()
-            
+
+            available = sum(float(r["quantity_in_stock"]) for r in fg_rows)
+            if available < qty_needed:
+                raise HTTPException(
+                    400,
+                    f"Insufficient stock for '{pname}': "
+                    f"available {available}, required {qty_needed}",
+                )
+
             rem = qty_needed
             for fg in fg_rows:
                 if rem <= 0:
@@ -495,14 +571,20 @@ def dispatch_so(so_id: int, body: DispatchCreate, db: Session = Depends(get_db),
     all_done = all(r["dispatched_qty"] >= r["quantity_sold"] for r in lines_after)
     any_done = any(r["dispatched_qty"] > 0 for r in lines_after)
 
-    new_status = po_row["status"]
+    # Writes dispatch_status only. This used to write `status`, which the
+    # payment endpoint also owned — so recording a dispatch silently destroyed
+    # the payment state (and vice-versa). The two are now separate columns.
+    new_status = po_row["dispatch_status"]
     if all_done:
-        new_status = 4 # Full Dispatch
+        new_status = 4  # Full Dispatch
     elif any_done:
-        new_status = 3 # Partial Dispatch
+        new_status = 3  # Partial Dispatch
 
-    if new_status != po_row["status"]:
-        db.execute(text("UPDATE sales_orders SET status = :st WHERE id = :id"), {"st": new_status, "id": so_id})
+    if new_status != po_row["dispatch_status"]:
+        db.execute(
+            text("UPDATE sales_orders SET dispatch_status = :st, updated_at = now() WHERE id = :id"),
+            {"st": new_status, "id": so_id},
+        )
 
     db.commit()
     return _serialize_so(db, so_id)

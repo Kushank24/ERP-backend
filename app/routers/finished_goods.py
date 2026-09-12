@@ -92,8 +92,10 @@ def create_fg(
             "pcat": body.product_category,
             "qty": body.quantity_in_stock,
             "woid": body.work_order_id,
-            "won": body.work_order_number.strip(),
-            "party": body.party_name.strip(),
+            # Both are Optional[str] = None, so .strip() raised AttributeError
+            # (a guaranteed 500) whenever either was omitted from the request.
+            "won": (body.work_order_number or "").strip() or None,
+            "party": (body.party_name or "").strip() or None,
             "cd": body.completion_date,
             "cost": body.production_cost,
             "notes": body.notes,

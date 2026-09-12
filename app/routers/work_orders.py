@@ -330,10 +330,31 @@ def patch_status(
     if current_status is None:
         raise HTTPException(404, "Work order not found")
 
+    # Completing consumes materials and produces finished goods, and there is
+    # no reversal for either. Refuse to walk a completed order backwards rather
+    # than leaving inventory silently wrong — the produced goods may already
+    # have been sold, so the stock cannot simply be handed back.
+    if current_status == "completed" and body.status != "completed":
+        raise HTTPException(
+            400,
+            "This work order is already completed. Reopening it would leave "
+            "material and finished-goods stock inconsistent, because the "
+            "consumption and production it recorded cannot be reversed.",
+        )
+
     if current_status != "completed" and body.status == "completed":
         wo = _load_wo(db, wo_id)
+
+        # ------------------------------------------------------------------
+        # 1. Work out total material consumption for the whole work order
+        # ------------------------------------------------------------------
+        # Aggregated across every product first, because one material can
+        # appear in several products' BOQs. Validating the total up front means
+        # we never apply a partial deduction and then fail half way through.
+        needed: dict[int, dict] = {}
+        unknown_materials: list[str] = []
+
         for p in wo["products"]:
-            # Reduce materials based on BoQ
             boq_lines = db.execute(
                 text(
                     """
@@ -352,26 +373,76 @@ def patch_status(
 
                 # Look up the material's inventory unit for conversion
                 existing_mat = db.execute(
-                    text("SELECT id, unit FROM materials WHERE LOWER(TRIM(name)) = LOWER(TRIM(:mname)) LIMIT 1"),
+                    text(
+                        "SELECT id, name, unit, length_weight_nos FROM materials "
+                        "WHERE LOWER(TRIM(name)) = LOWER(TRIM(:mname)) LIMIT 1 FOR UPDATE"
+                    ),
                     {"mname": b["name"]}
                 ).mappings().first()
 
                 if not existing_mat:
-                    continue  # material not in inventory — nothing to deduct
+                    # Previously skipped silently, which under-consumed stock
+                    # and hid a broken BOQ→material name link.
+                    unknown_materials.append(str(b["name"]))
+                    continue
 
                 inv_unit = (existing_mat["unit"] or "").strip()
                 converted = convert_qty(raw_deduction, boq_unit, inv_unit)
                 deduction = converted if converted is not None else raw_deduction
 
-                db.execute(
-                    text(
-                        "UPDATE materials SET length_weight_nos = length_weight_nos - :deduct "
-                        "WHERE id = :mid"
-                    ),
-                    {"deduct": deduction, "mid": existing_mat["id"]}
+                entry = needed.setdefault(
+                    existing_mat["id"],
+                    {
+                        "name": existing_mat["name"],
+                        "unit": inv_unit,
+                        "available": float(existing_mat["length_weight_nos"] or 0),
+                        "required": 0.0,
+                    },
                 )
+                entry["required"] += deduction
 
-            # Insert into finished goods
+        if unknown_materials:
+            names = ", ".join(sorted(set(unknown_materials)))
+            raise HTTPException(
+                400,
+                "Cannot complete: these bill-of-quantities materials are not in "
+                f"inventory, so their consumption cannot be recorded — {names}. "
+                "Add them to inventory (or correct the BOQ material name) first.",
+            )
+
+        short = [
+            e for e in needed.values()
+            if e["available"] + 1e-9 < e["required"]
+        ]
+        if short:
+            detail = "; ".join(
+                f"{e['name']}: available {e['available']:.4g} {e['unit']}, "
+                f"required {e['required']:.4g} {e['unit']}"
+                for e in sorted(short, key=lambda x: x["name"])
+            )
+            raise HTTPException(400, f"Insufficient material stock — {detail}")
+
+        for mid, e in needed.items():
+            db.execute(
+                text(
+                    "UPDATE materials SET length_weight_nos = length_weight_nos - :deduct "
+                    "WHERE id = :mid"
+                ),
+                {"deduct": e["required"], "mid": mid}
+            )
+
+        # ------------------------------------------------------------------
+        # 2. Produce only what has not already been issued
+        # ------------------------------------------------------------------
+        # POST /issue-products already inserts finished-goods rows for the
+        # quantity it issues. Producing the full ordered quantity again here
+        # double-counted output: a fully-issued work order that was then
+        # completed created its goods twice while consuming materials once.
+        for p in wo["products"]:
+            outstanding = float(p["remaining_qty"])
+            if outstanding <= 1e-9:
+                continue  # already issued to finished goods in full
+
             p_info = db.execute(
                 text("SELECT name, product_code, category FROM products WHERE id = :pid"),
                 {"pid": p["product_id"]}
@@ -393,17 +464,17 @@ def patch_status(
                         "pname": p_info["name"],
                         "pcode": p_info["product_code"],
                         "pcat": p_info["category"],
-                        "qty": p["quantity"],
+                        "qty": outstanding,
                         "woid": wo_id,
                         "wonum": wo["work_order_number"],
                         "party": wo["party_name"]
                     }
                 )
 
-    r = db.execute(
-        text("UPDATE work_orders SET status = :s, updated_at = now() WHERE id = :id RETURNING id"),
+    db.execute(
+        text("UPDATE work_orders SET status = :s, updated_at = now() WHERE id = :id"),
         {"s": body.status, "id": wo_id},
-    ).first()
+    )
     db.commit()
     return _load_wo(db, wo_id)
 

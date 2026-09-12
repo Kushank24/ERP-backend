@@ -16,7 +16,7 @@ from ..pdf_service import PDFGenerationService
 
 router = APIRouter(prefix="/offers", tags=["offers"])
 
-VALID_STATUSES = {"draft", "sent", "accepted", "rejected", "expired"}
+VALID_STATUSES = {"draft", "sent", "accepted", "partial", "rejected", "expired"}
 _pdf_svc = PDFGenerationService()
 
 
@@ -29,6 +29,7 @@ class OfferItemIn(BaseModel):
     product_id: Optional[int] = None
     description: str = Field(min_length=1)
     quantity: int = Field(default=1, ge=1)
+    unit: str = Field(default="PC", max_length=10)
     unit_price: float = Field(default=0, ge=0)
     specifications: List[SpecValueIn] = Field(default_factory=list)
 
@@ -368,6 +369,28 @@ def update_call_status(
     return {"call_status": new_status}
 
 
+@router.patch("/{offer_id}/items/{item_id}/accepted")
+def toggle_item_accepted(
+    offer_id: int,
+    item_id: int,
+    db: Session = Depends(get_db),
+    _user: dict = Depends(get_current_user),
+):
+    row = db.execute(
+        text("SELECT accepted FROM offer_items WHERE id = :item_id AND offer_id = :offer_id"),
+        {"item_id": item_id, "offer_id": offer_id},
+    ).first()
+    if not row:
+        raise HTTPException(status_code=404, detail="Item not found")
+    new_val = not row[0]
+    db.execute(
+        text("UPDATE offer_items SET accepted = :v WHERE id = :item_id"),
+        {"v": new_val, "item_id": item_id},
+    )
+    db.commit()
+    return {"accepted": new_val}
+
+
 @router.delete("/{offer_id}", status_code=204)
 def delete_offer(
     offer_id: int,
@@ -408,12 +431,13 @@ def _insert_items(db: Session, offer_id: int, items: list) -> None:
     item_rows = db.execute(
         text("""
             INSERT INTO offer_items
-                (offer_id, product_id, description, quantity, unit_price, total_price)
+                (offer_id, product_id, description, quantity, unit, unit_price, total_price)
             SELECT
                 :offer_id,
                 unnest(CAST(:product_ids AS int[])),
                 unnest(CAST(:descriptions AS text[])),
                 unnest(CAST(:quantities AS int[])),
+                unnest(CAST(:units AS text[])),
                 unnest(CAST(:unit_prices AS numeric[])),
                 unnest(CAST(:total_prices AS numeric[]))
             RETURNING id
@@ -423,6 +447,7 @@ def _insert_items(db: Session, offer_id: int, items: list) -> None:
             "product_ids": [item.product_id for item in items],
             "descriptions": [item.description for item in items],
             "quantities": [item.quantity for item in items],
+            "units": [item.unit or "PC" for item in items],
             "unit_prices": [item.unit_price for item in items],
             "total_prices": [item.quantity * item.unit_price for item in items],
         },

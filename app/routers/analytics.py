@@ -1009,9 +1009,18 @@ def so_analytics(
         SELECT
           COUNT(*)                                                                       AS total,
           COALESCE(SUM(total_amount), 0)                                                 AS total_revenue,
-          COUNT(*) FILTER (WHERE status = 1)                                             AS not_received,
-          COUNT(*) FILTER (WHERE status = 2)                                             AS partial,
-          COUNT(*) FILTER (WHERE status = 3)                                             AS received,
+          -- Reads payment_status, not the old conflated `status` column, which
+          -- a dispatch could overwrite. `payment_status IS NULL` is the legacy
+          -- bulk import (no recorded payment state) and is reported separately
+          -- instead of being dropped from the breakdown entirely, which is what
+          -- happened while these buckets keyed off `status`.
+          COUNT(*) FILTER (WHERE payment_status = 1)                                     AS not_received,
+          COUNT(*) FILTER (WHERE payment_status = 2)                                     AS partial,
+          COUNT(*) FILTER (WHERE payment_status = 3)                                     AS received,
+          COUNT(*) FILTER (WHERE payment_status IS NULL)                                 AS payment_unknown,
+          COUNT(*) FILTER (WHERE dispatch_status = 1)                                    AS not_dispatched,
+          COUNT(*) FILTER (WHERE dispatch_status = 3)                                    AS partly_dispatched,
+          COUNT(*) FILTER (WHERE dispatch_status = 4)                                    AS fully_dispatched,
           COUNT(*) FILTER (
             WHERE delivery_date < CURRENT_DATE AND actual_delivery_date IS NULL
           )                                                                               AS overdue,
@@ -1079,6 +1088,10 @@ def so_analytics(
             "not_received":             int(totals_row["not_received"]             or 0),
             "partial":                  int(totals_row["partial"]                  or 0),
             "received":                 int(totals_row["received"]                 or 0),
+            "payment_unknown":          int(totals_row["payment_unknown"]          or 0),
+            "not_dispatched":           int(totals_row["not_dispatched"]           or 0),
+            "partly_dispatched":        int(totals_row["partly_dispatched"]        or 0),
+            "fully_dispatched":         int(totals_row["fully_dispatched"]         or 0),
             "overdue":                  int(totals_row["overdue"]                  or 0),
             "payment_collection_rate":  float(totals_row["payment_collection_rate"] or 0),
         },

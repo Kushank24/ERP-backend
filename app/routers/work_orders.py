@@ -10,7 +10,7 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from ..db import get_db
-from ..deps import get_current_user
+from ..deps import get_current_user, require_module
 from ..pdf_service import PDFGenerationService
 from ..unit_conversion import convert_qty
 
@@ -182,7 +182,7 @@ def list_parties(db: Session = Depends(get_db), user: dict = Depends(get_current
     return [dict(r) for r in rows]
 
 
-@router.post("", status_code=201)
+@router.post("", status_code=201, dependencies=[Depends(require_module("work_orders"))])
 def create_wo(
     body: WorkOrderCreate,
     db: Session = Depends(get_db),
@@ -244,7 +244,7 @@ def create_wo(
     return _load_wo(db, wid)
 
 
-@router.patch("/{wo_id}")
+@router.patch("/{wo_id}", dependencies=[Depends(require_module("work_orders"))])
 def update_wo(
     wo_id: int,
     body: WorkOrderUpdate,
@@ -315,7 +315,7 @@ class StatusBody(BaseModel):
     status: Literal["in-progress", "completed"]
 
 
-@router.patch("/{wo_id}/status")
+@router.patch("/{wo_id}/status", dependencies=[Depends(require_module("work_orders"))])
 def patch_status(
     wo_id: int,
     body: StatusBody,
@@ -419,7 +419,7 @@ class ProductIssueBody(BaseModel):
     items: List[ProductIssueItem] = Field(min_length=1)
 
 
-@router.post("/{wo_id}/issue-products", status_code=201)
+@router.post("/{wo_id}/issue-products", status_code=201, dependencies=[Depends(require_module("work_orders"))])
 def issue_products(
     wo_id: int,
     body: ProductIssueBody,

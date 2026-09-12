@@ -9,7 +9,7 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from ..db import get_db
-from ..deps import get_current_user
+from ..deps import get_current_user, require_module
 
 router = APIRouter(prefix="/enquiries", tags=["enquiries"])
 
@@ -138,7 +138,7 @@ def list_enquiries(
     return {"data": [dict(r) for r in rows], "total": total}
 
 
-@router.post("", status_code=201)
+@router.post("", status_code=201, dependencies=[Depends(require_module("enquiries"))])
 def create_enquiry(
     body: EnquiryCreate,
     db: Session = Depends(get_db),
@@ -202,7 +202,7 @@ def get_enquiry(
     return _serialize(db, enquiry_id)
 
 
-@router.put("/{enquiry_id}")
+@router.put("/{enquiry_id}", dependencies=[Depends(require_module("enquiries"))])
 def update_enquiry(
     enquiry_id: int,
     body: EnquiryUpdate,
@@ -258,7 +258,7 @@ def update_enquiry(
     return _serialize(db, enquiry_id)
 
 
-@router.delete("/{enquiry_id}", status_code=204)
+@router.delete("/{enquiry_id}", status_code=204, dependencies=[Depends(require_module("enquiries"))])
 def delete_enquiry(
     enquiry_id: int,
     db: Session = Depends(get_db),

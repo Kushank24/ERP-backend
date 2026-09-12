@@ -14,7 +14,7 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from ..db import get_db
-from ..deps import get_current_user
+from ..deps import get_current_user, require_module
 from ..config import settings
 from .. import email_service
 
@@ -22,6 +22,10 @@ from .. import email_service
 _UPLOAD_DIR = Path(__file__).resolve().parent.parent.parent / "uploaded_images"
 
 router = APIRouter(prefix="/email-campaigns", tags=["email-campaigns"])
+
+# Routes that must stay reachable without a bearer token. Mounted separately in
+# main.py so the email_campaigns module gate does not apply to them.
+public_router = APIRouter(prefix="/email-campaigns", tags=["email-campaigns"])
 
 # ── DB bootstrap ───────────────────────────────────────────────────────────────
 _SETUP_SQL = """
@@ -139,7 +143,7 @@ def _compress_image(raw: bytes, ext: str) -> tuple[bytes, str]:
         return raw, ext  # fall back to original if Pillow fails
 
 
-@router.post("/upload-image", status_code=201)
+@router.post("/upload-image", status_code=201, dependencies=[Depends(require_module("email_campaigns"))])
 async def upload_image(
     file: UploadFile = File(...),
     user: dict = Depends(get_current_user),
@@ -161,9 +165,17 @@ async def upload_image(
     return {"url": f"/api/v1/email-campaigns/images/{filename}"}
 
 
-@router.get("/images/{filename}")
+@public_router.get("/images/{filename}")
 def serve_image(filename: str):
-    """Serve a previously uploaded campaign image."""
+    """
+    Serve a previously uploaded campaign image.
+
+    Intentionally unauthenticated: this URL is embedded as an absolute
+    ``src="…"`` in outbound email HTML, and recipients' mail clients fetch it
+    with no Authorization header. Requiring a token here would break images in
+    every campaign already sent. Exposure is limited by the uuid4 filename
+    (not enumerable) and the path-traversal guard below.
+    """
     # Prevent path traversal
     if ".." in filename or "/" in filename or "\\" in filename:
         raise HTTPException(400, "Invalid filename")
@@ -173,7 +185,7 @@ def serve_image(filename: str):
     return FileResponse(str(path))
 
 
-@router.delete("/{campaign_id}", status_code=204)
+@router.delete("/{campaign_id}", status_code=204, dependencies=[Depends(require_module("email_campaigns"))])
 def delete_campaign(
     campaign_id: int,
     db: Session = Depends(get_db),
@@ -217,7 +229,7 @@ def get_contacts(db: Session = Depends(get_db), user: dict = Depends(get_current
     return [dict(r) for r in rows]
 
 
-@router.post("/parse-contacts")
+@router.post("/parse-contacts", dependencies=[Depends(require_module("email_campaigns"))])
 async def parse_contacts(
     file: UploadFile = File(...),
     user: dict = Depends(get_current_user),
@@ -253,7 +265,7 @@ def get_active(db: Session = Depends(get_db), user: dict = Depends(get_current_u
     return {"running": email_service.is_running(), "campaign": dict(row) if row else None}
 
 
-@router.post("", status_code=201)
+@router.post("", status_code=201, dependencies=[Depends(require_module("email_campaigns"))])
 def create_campaign(
     body: CampaignCreate,
     db: Session = Depends(get_db),
@@ -296,7 +308,7 @@ def create_campaign(
     return {"id": campaign_id, "total_recipients": len(recipients)}
 
 
-@router.post("/{campaign_id}/stop")
+@router.post("/{campaign_id}/stop", dependencies=[Depends(require_module("email_campaigns"))])
 def stop_campaign(campaign_id: int, db: Session = Depends(get_db), user: dict = Depends(get_current_user)):
     _ = user
     email_service.stop_campaign()

@@ -8,7 +8,7 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from ..db import get_db
-from ..deps import get_current_user
+from ..deps import get_current_user, require_module
 
 router = APIRouter(prefix="/companies", tags=["companies"])
 
@@ -55,7 +55,7 @@ def list_companies(
     return {"data": [dict(r) for r in rows], "total": total}
 
 
-@router.post("", status_code=201)
+@router.post("", status_code=201, dependencies=[Depends(require_module("companies"))])
 def create_company(
     body: CompanyIn,
     db: Session = Depends(get_db),
@@ -82,7 +82,7 @@ def get_company(
     return _row(db, company_id)
 
 
-@router.put("/{company_id}")
+@router.put("/{company_id}", dependencies=[Depends(require_module("companies"))])
 def update_company(
     company_id: int,
     body: CompanyIn,
@@ -103,7 +103,7 @@ def update_company(
     return _row(db, company_id)
 
 
-@router.delete("/{company_id}", status_code=204)
+@router.delete("/{company_id}", status_code=204, dependencies=[Depends(require_module("companies"))])
 def delete_company(
     company_id: int,
     db: Session = Depends(get_db),

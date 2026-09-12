@@ -11,7 +11,7 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from ..db import get_db
-from ..deps import get_current_user
+from ..deps import get_current_user, require_module
 from ..pdf_service import PDFGenerationService
 from ..unit_conversion import convert_qty as _convert_qty
 
@@ -175,7 +175,7 @@ def list_suppliers(db: Session = Depends(get_db), user: dict = Depends(get_curre
     return [dict(r) for r in rows]
 
 
-@router.post("", status_code=201)
+@router.post("", status_code=201, dependencies=[Depends(require_module("purchase_orders"))])
 def create_po(
     body: PurchaseOrderCreate,
     db: Session = Depends(get_db),
@@ -239,7 +239,7 @@ def create_po(
     db.commit()
     return _serialize_po(db, po_id)
 
-@router.patch("/{po_id}")
+@router.patch("/{po_id}", dependencies=[Depends(require_module("purchase_orders"))])
 def update_po(
     po_id: int,
     body: PurchaseOrderUpdate,
@@ -333,7 +333,7 @@ def update_po(
 class PoStatusBody(BaseModel):
     status: int
 
-@router.patch("/{po_id}/status")
+@router.patch("/{po_id}/status", dependencies=[Depends(require_module("purchase_orders"))])
 def patch_po_status(
     po_id: int,
     body: PoStatusBody,
@@ -406,7 +406,7 @@ class PoReceiveBody(BaseModel):
     items: List[PoReceiveItem]
     bill_numbers_to_add: List[str] = Field(default_factory=list)
 
-@router.post("/{po_id}/receive")
+@router.post("/{po_id}/receive", dependencies=[Depends(require_module("purchase_orders"))])
 def receive_po_items(
     po_id: int,
     body: PoReceiveBody,
@@ -503,7 +503,7 @@ class AdditionalCostItem(BaseModel):
 class AdditionalCostsBody(BaseModel):
     items: List[AdditionalCostItem] = Field(default_factory=list)
 
-@router.patch("/{po_id}/additional-costs")
+@router.patch("/{po_id}/additional-costs", dependencies=[Depends(require_module("purchase_orders"))])
 def update_additional_costs(po_id: int, body: AdditionalCostsBody, db: Session = Depends(get_db), user: dict = Depends(get_current_user)):
     _ = user
     if not db.execute(text("SELECT id FROM purchase_orders WHERE id = :id"), {"id": po_id}).first():
@@ -523,7 +523,7 @@ def update_additional_costs(po_id: int, body: AdditionalCostsBody, db: Session =
     return _serialize_po(db, po_id)
 
 
-@router.delete("/{po_id}", status_code=204)
+@router.delete("/{po_id}", status_code=204, dependencies=[Depends(require_module("purchase_orders"))])
 def delete_po(
     po_id: int,
     db: Session = Depends(get_db),

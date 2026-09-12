@@ -662,7 +662,7 @@ class PDFGenerationService:
             Paragraph("Item Description", header_cell_st),
             Paragraph("Unit", header_cell_st),
             Paragraph("Qty", header_cell_st),
-            Paragraph(f"Rate in {sym}<br/>Per PC", header_cell_st),
+            Paragraph(f"Rate in {sym}<br/>Per Unit", header_cell_st),
             Paragraph("Total<br/>Amount", header_cell_st),
         ]]
 
@@ -694,7 +694,7 @@ class PDFGenerationService:
             rows.append([
                 str(i),
                 Paragraph(desc_html, desc_st),
-                "PC",
+                str(item.get("unit") or "PC"),
                 str(qty),
                 rate_cell,
                 total_cell,

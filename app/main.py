@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import logging
 
-from fastapi import FastAPI, Request
+from fastapi import Depends, FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from sqlalchemy.exc import OperationalError, SQLAlchemyError
 
 from .config import settings
+from .deps import require_any_module
 from .routers import (
     analytics,
     auth,
@@ -141,23 +142,77 @@ async def sqlalchemy_generic_error_handler(
 
 
 # ---------------------------------------------------------------------------
-# Routers
+# Routers + authorization
+# ---------------------------------------------------------------------------
+# Two layers of authorization:
+#
+#   1. Router level (here) — a *loose* gate listing every module whose screen
+#      legitimately reads from this router. The Offers screen reads companies
+#      and enquiries; the Purchase Orders screen reads materials; the analytics
+#      screens read their source documents. Without this breadth a role would
+#      be able to open a page it owns but not load the page's own dropdowns.
+#
+#   2. Route level (in each router) — a *strict* require_module() on every
+#      mutating endpoint, so a write is only ever accepted from a role that
+#      owns that module. Both layers must pass.
+#
+# /auth is deliberately ungated: /auth/login must be reachable to obtain a
+# token, and /auth/me only needs a valid one.
 # ---------------------------------------------------------------------------
 
+
+def _gate(*modules: str) -> list:
+    return [Depends(require_any_module(list(modules)))]
+
+
 app.include_router(auth.router, prefix="/api/v1")
-app.include_router(dashboard.router, prefix="/api/v1")
-app.include_router(companies.router, prefix="/api/v1")
-app.include_router(enquiries.router, prefix="/api/v1")
-app.include_router(offers.router, prefix="/api/v1")
-app.include_router(catalog_products.router, prefix="/api/v1")
-app.include_router(materials.router, prefix="/api/v1")
-app.include_router(products.router, prefix="/api/v1")
-app.include_router(purchase_orders.router, prefix="/api/v1")
-app.include_router(work_orders.router, prefix="/api/v1")
-app.include_router(finished_goods.router, prefix="/api/v1")
-app.include_router(sales_orders.router, prefix="/api/v1")
-app.include_router(email_campaigns.router, prefix="/api/v1")
-app.include_router(analytics.router, prefix="/api/v1")
+app.include_router(dashboard.router, prefix="/api/v1", dependencies=_gate("dashboard"))
+app.include_router(
+    companies.router, prefix="/api/v1",
+    dependencies=_gate("companies", "enquiries", "offers", "sales_orders", "crm_analytics"),
+)
+app.include_router(
+    enquiries.router, prefix="/api/v1",
+    dependencies=_gate("enquiries", "offers", "crm_analytics"),
+)
+app.include_router(offers.router, prefix="/api/v1", dependencies=_gate("offers", "crm_analytics"))
+app.include_router(
+    catalog_products.router, prefix="/api/v1",
+    dependencies=_gate("product_catalog", "offers", "enquiries"),
+)
+app.include_router(
+    materials.router, prefix="/api/v1",
+    dependencies=_gate("inventory", "purchase_orders", "products_boq", "work_orders", "finished_goods"),
+)
+app.include_router(
+    products.router, prefix="/api/v1",
+    dependencies=_gate("products_boq", "pricing", "work_orders", "offers"),
+)
+app.include_router(
+    purchase_orders.router, prefix="/api/v1",
+    dependencies=_gate("purchase_orders", "po_analytics"),
+)
+app.include_router(
+    work_orders.router, prefix="/api/v1",
+    dependencies=_gate("work_orders", "finished_goods", "production_analytics"),
+)
+app.include_router(
+    finished_goods.router, prefix="/api/v1",
+    dependencies=_gate("finished_goods", "sales_orders", "work_orders"),
+)
+app.include_router(
+    sales_orders.router, prefix="/api/v1",
+    dependencies=_gate("sales_orders", "so_analytics"),
+)
+app.include_router(
+    email_campaigns.router, prefix="/api/v1", dependencies=_gate("email_campaigns"),
+)
+# Campaign images are fetched by recipients' mail clients, which send no token.
+app.include_router(email_campaigns.public_router, prefix="/api/v1")
+app.include_router(
+    analytics.router, prefix="/api/v1",
+    dependencies=_gate("crm_analytics", "production_analytics", "po_analytics", "so_analytics"),
+)
 
 
 @app.get("/health")

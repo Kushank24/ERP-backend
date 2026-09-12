@@ -11,47 +11,12 @@ from sqlalchemy.orm import Session
 
 from .config import settings
 from .db import get_db
-from .permissions import modules_for_username
+from .permissions import modules_for_role
 from .security import decode_supabase_access_token, decode_token
 
 logger = logging.getLogger(__name__)
 
 security = HTTPBearer(auto_error=False)
-
-
-def _resolve_supabase_role(sup: dict) -> str:
-    """
-    Determine the application role for a Supabase Auth user.
-
-    Resolution order (first non-empty value wins):
-    1. ``app_metadata.role``   — set server-side via Supabase Admin API; cannot
-                                  be overwritten by the user themselves.
-    2. ``user_metadata.role``  — set by the user or during sign-up.
-    3. Admin e-mail list       — SUPABASE_ADMIN_EMAILS env var; any matching
-                                  address always gets "admin".
-    4. SUPABASE_DEFAULT_ROLE   — configurable fallback (default: "admin").
-    """
-    # 1. app_metadata.role  (server-controlled — most trusted)
-    am = sup.get("app_metadata") or {}
-    if not isinstance(am, dict):
-        am = {}
-    if am.get("role"):
-        return str(am["role"]).strip()
-
-    # 2. user_metadata.role
-    um = sup.get("user_metadata") or {}
-    if not isinstance(um, dict):
-        um = {}
-    if um.get("role"):
-        return str(um["role"]).strip()
-
-    # 3. Admin e-mail list
-    email = (sup.get("email") or "").strip().lower()
-    if email and email in settings.supabase_admin_email_set:
-        return "admin"
-
-    # 4. Configurable default
-    return settings.supabase_default_role or "admin"
 
 
 def get_current_user(
@@ -103,7 +68,7 @@ def get_current_user(
                 role,
             )
 
-            allowed = modules_for_username(uname_key, role)
+            allowed = modules_for_role(role)
             return {
                 "id": sub,
                 "username": username,
@@ -136,7 +101,7 @@ def get_current_user(
     if not row:
         raise HTTPException(status_code=401, detail="User not found")
 
-    allowed = modules_for_username(row["username"], row["role"])
+    allowed = modules_for_role(row["role"])
     return {
         "id": str(row["id"]),
         "username": row["username"],
@@ -146,8 +111,44 @@ def get_current_user(
 
 
 def require_module(module: str):
+    """
+    Authorize a single module. Use on every mutating route so a write is only
+    accepted from a role that owns that module.
+    """
+
     def _inner(user: Annotated[dict, Depends(get_current_user)]) -> dict:
         if module not in user["allowed_modules"]:
+            logger.warning(
+                "Authorization denied: user=%r role=%r module=%r",
+                user.get("username"),
+                user.get("role"),
+                module,
+            )
+            raise HTTPException(status_code=403, detail="Forbidden")
+        return user
+
+    return _inner
+
+
+def require_any_module(modules: list[str]):
+    """
+    Authorize if the user holds *any* of ``modules``.
+
+    Applied at router level so legitimate cross-module reads keep working — the
+    Offers screen needs to read companies and enquiries, the Purchase Orders
+    screen needs to read materials, and so on. Mutating routes carry an
+    additional ``require_module`` for the owning module on top of this.
+    """
+    allowed_set = frozenset(modules)
+
+    def _inner(user: Annotated[dict, Depends(get_current_user)]) -> dict:
+        if allowed_set.isdisjoint(user["allowed_modules"]):
+            logger.warning(
+                "Authorization denied: user=%r role=%r needed any of %r",
+                user.get("username"),
+                user.get("role"),
+                modules,
+            )
             raise HTTPException(status_code=403, detail="Forbidden")
         return user
 

@@ -8,7 +8,7 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from ..db import get_db
-from ..deps import get_current_user
+from ..deps import get_current_user, require_module
 
 router = APIRouter(prefix="/catalog-products", tags=["catalog-products"])
 
@@ -127,7 +127,7 @@ class SpecCreate(BaseModel):
     name: str = Field(min_length=1)
 
 
-@router.post("/specifications/catalog", status_code=201)
+@router.post("/specifications/catalog", status_code=201, dependencies=[Depends(require_module("product_catalog"))])
 def create_specification(
     body: SpecCreate,
     db: Session = Depends(get_db),
@@ -166,7 +166,7 @@ def get_specifications(
     return [dict(r) for r in rows]
 
 
-@router.put("/{cp_id}/specifications")
+@router.put("/{cp_id}/specifications", dependencies=[Depends(require_module("product_catalog"))])
 def set_specifications(
     cp_id: int,
     body: SpecsUpdate,
@@ -207,7 +207,7 @@ def get_catalog_product(
     return _row(db, cp_id)
 
 
-@router.post("", status_code=201)
+@router.post("", status_code=201, dependencies=[Depends(require_module("product_catalog"))])
 def create_catalog_product(
     body: CatalogProductCreate,
     db: Session = Depends(get_db),
@@ -225,7 +225,7 @@ def create_catalog_product(
     return _row(db, row["id"])
 
 
-@router.patch("/{cp_id}")
+@router.patch("/{cp_id}", dependencies=[Depends(require_module("product_catalog"))])
 def patch_catalog_product(
     cp_id: int,
     body: CatalogProductPatch,
@@ -244,7 +244,7 @@ def patch_catalog_product(
     return _row(db, cp_id)
 
 
-@router.delete("/{cp_id}", status_code=204)
+@router.delete("/{cp_id}", status_code=204, dependencies=[Depends(require_module("product_catalog"))])
 def delete_catalog_product(
     cp_id: int,
     db: Session = Depends(get_db),

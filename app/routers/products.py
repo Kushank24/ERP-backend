@@ -15,7 +15,7 @@ from sqlalchemy.orm import Session
 
 from ..boq_math import total_quantity_consumed
 from ..db import get_db
-from ..deps import get_current_user
+from ..deps import get_current_user, require_module
 from ..pdf_service import PDFGenerationService
 
 router = APIRouter(prefix="/products", tags=["products"])
@@ -192,7 +192,7 @@ def list_all_specifications(
     return [dict(r) for r in rows]
 
 
-@router.post("/specifications/catalog", status_code=201)
+@router.post("/specifications/catalog", status_code=201, dependencies=[Depends(require_module("products_boq"))])
 def create_specification(
     body: SpecificationCreate,
     db: Session = Depends(get_db),
@@ -232,7 +232,7 @@ def get_product_specifications(
     return [dict(r) for r in rows]
 
 
-@router.put("/{product_id}/specifications")
+@router.put("/{product_id}/specifications", dependencies=[Depends(require_module("products_boq"))])
 def set_product_specifications(
     product_id: int,
     body: ProductSpecsUpdate,
@@ -340,7 +340,7 @@ def get_product(product_id: int, db: Session = Depends(get_db), user: dict = Dep
     return _product_dict(db, product_id)
 
 
-@router.post("", status_code=201)
+@router.post("", status_code=201, dependencies=[Depends(require_module("products_boq"))])
 def create_product(
     body: ProductCreate,
     db: Session = Depends(get_db),
@@ -404,7 +404,7 @@ def create_product(
     return _product_dict(db, pid)
 
 
-@router.patch("/{product_id}")
+@router.patch("/{product_id}", dependencies=[Depends(require_module("products_boq"))])
 def patch_product(
     product_id: int,
     body: ProductPatch,
@@ -539,7 +539,7 @@ def download_boq_pdf(
     )
 
 
-@router.post("/{product_id}/boq", status_code=201)
+@router.post("/{product_id}/boq", status_code=201, dependencies=[Depends(require_module("products_boq"))])
 def add_boq_line(
     product_id: int,
     body: BoqLineAdd,
@@ -581,7 +581,7 @@ def add_boq_line(
     return _product_dict(db, product_id)
 
 
-@router.patch("/{product_id}/boq/{boq_id}")
+@router.patch("/{product_id}/boq/{boq_id}", dependencies=[Depends(require_module("products_boq"))])
 def patch_boq_line(
     product_id: int,
     boq_id: int,
@@ -617,7 +617,7 @@ def patch_boq_line(
     return _product_dict(db, product_id)
 
 
-@router.post("/bulk-upload", status_code=201)
+@router.post("/bulk-upload", status_code=201, dependencies=[Depends(require_module("products_boq"))])
 async def bulk_upload_products(
     file: UploadFile = File(...),
     db: Session = Depends(get_db),
@@ -736,7 +736,7 @@ async def bulk_upload_products(
     }
 
 
-@router.delete("/{product_id}/boq/{boq_id}", status_code=200)
+@router.delete("/{product_id}/boq/{boq_id}", status_code=200, dependencies=[Depends(require_module("products_boq"))])
 def remove_boq_line(
     product_id: int,
     boq_id: int,

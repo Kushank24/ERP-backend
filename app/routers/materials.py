@@ -8,7 +8,7 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from ..db import get_db
-from ..deps import get_current_user
+from ..deps import get_current_user, require_module
 
 
 
@@ -87,7 +87,7 @@ def list_materials(
     }
 
 
-@router.post("", status_code=201)
+@router.post("", status_code=201, dependencies=[Depends(require_module("inventory"))])
 def create_material(
     body: MaterialCreate,
     db: Session = Depends(get_db),
@@ -117,7 +117,7 @@ def create_material(
     return dict(res)
 
 
-@router.patch("/{material_id}")
+@router.patch("/{material_id}", dependencies=[Depends(require_module("inventory"))])
 def patch_material(
     material_id: int,
     body: MaterialPatch,
@@ -158,7 +158,7 @@ def patch_material(
     return dict(r)
 
 
-@router.post("/{material_id}/convert", status_code=201)
+@router.post("/{material_id}/convert", status_code=201, dependencies=[Depends(require_module("inventory"))])
 def convert_to_finished_good(
     material_id: int,
     body: ConvertToFGBody,

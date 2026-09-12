@@ -8,7 +8,7 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from ..db import get_db
-from ..deps import get_current_user
+from ..deps import get_current_user, require_module
 
 router = APIRouter(prefix="/analytics", tags=["analytics"])
 
@@ -21,7 +21,7 @@ def _fmt_month(dt: datetime) -> str:
 # CRM ANALYTICS
 # ─────────────────────────────────────────────────────────────────────────────
 
-@router.get("/crm")
+@router.get("/crm", dependencies=[Depends(require_module("crm_analytics"))])
 def crm_analytics(
     db: Session = Depends(get_db),
     _: dict = Depends(get_current_user),
@@ -148,7 +148,7 @@ def crm_analytics(
 # COMPANY LIST (for dropdown)
 # ─────────────────────────────────────────────────────────────────────────────
 
-@router.get("/companies")
+@router.get("/companies", dependencies=[Depends(require_module("crm_analytics"))])
 def list_companies_summary(
     db: Session = Depends(get_db),
     _: dict = Depends(get_current_user),
@@ -196,7 +196,7 @@ def list_companies_summary(
 # COMPANY DEEP-DIVE
 # ─────────────────────────────────────────────────────────────────────────────
 
-@router.get("/company/{company_id}")
+@router.get("/company/{company_id}", dependencies=[Depends(require_module("crm_analytics"))])
 def company_analytics(
     company_id: int,
     db: Session = Depends(get_db),
@@ -379,7 +379,7 @@ def company_analytics(
 # PRODUCTION ANALYTICS
 # ─────────────────────────────────────────────────────────────────────────────
 
-@router.get("/production")
+@router.get("/production", dependencies=[Depends(require_module("production_analytics"))])
 def production_analytics(
     db: Session = Depends(get_db),
     _: dict = Depends(get_current_user),
@@ -550,7 +550,7 @@ def production_analytics(
 # PRODUCTION CLIENT LIST
 # ─────────────────────────────────────────────────────────────────────────────
 
-@router.get("/production/clients")
+@router.get("/production/clients", dependencies=[Depends(require_module("production_analytics"))])
 def list_production_clients(
     db: Session = Depends(get_db),
     _: dict = Depends(get_current_user),
@@ -598,7 +598,7 @@ def list_production_clients(
 # PRODUCTION CLIENT DEEP-DIVE
 # ─────────────────────────────────────────────────────────────────────────────
 
-@router.get("/production/client")
+@router.get("/production/client", dependencies=[Depends(require_module("production_analytics"))])
 def production_client_analytics(
     name: str = Query(..., description="party_name to analyse"),
     db: Session = Depends(get_db),
@@ -723,7 +723,7 @@ def production_client_analytics(
 # PURCHASE ORDER ANALYTICS
 # ─────────────────────────────────────────────────────────────────────────────
 
-@router.get("/po")
+@router.get("/po", dependencies=[Depends(require_module("po_analytics"))])
 def po_analytics(
     db: Session = Depends(get_db),
     _: dict = Depends(get_current_user),
@@ -833,7 +833,7 @@ def po_analytics(
 # PO SUPPLIER LIST
 # ─────────────────────────────────────────────────────────────────────────────
 
-@router.get("/po/suppliers")
+@router.get("/po/suppliers", dependencies=[Depends(require_module("po_analytics"))])
 def list_po_suppliers(db: Session = Depends(get_db), _: dict = Depends(get_current_user)):
     rows = db.execute(text("""
         SELECT s.name,
@@ -859,7 +859,7 @@ def list_po_suppliers(db: Session = Depends(get_db), _: dict = Depends(get_curre
 # PO SUPPLIER DEEP-DIVE
 # ─────────────────────────────────────────────────────────────────────────────
 
-@router.get("/po/supplier")
+@router.get("/po/supplier", dependencies=[Depends(require_module("po_analytics"))])
 def po_supplier_analytics(
     name: str = Query(..., description="Supplier name"),
     db: Session = Depends(get_db),
@@ -989,7 +989,7 @@ def po_supplier_analytics(
 # SALES ORDER ANALYTICS
 # ─────────────────────────────────────────────────────────────────────────────
 
-@router.get("/so")
+@router.get("/so", dependencies=[Depends(require_module("so_analytics"))])
 def so_analytics(
     db: Session = Depends(get_db),
     _: dict = Depends(get_current_user),
@@ -1091,7 +1091,7 @@ def so_analytics(
 # SO CUSTOMER LIST
 # ─────────────────────────────────────────────────────────────────────────────
 
-@router.get("/so/customers")
+@router.get("/so/customers", dependencies=[Depends(require_module("so_analytics"))])
 def list_so_customers(db: Session = Depends(get_db), _: dict = Depends(get_current_user)):
     rows = db.execute(text("""
         SELECT company_name AS name,
@@ -1116,7 +1116,7 @@ def list_so_customers(db: Session = Depends(get_db), _: dict = Depends(get_curre
 # SO CUSTOMER DEEP-DIVE
 # ─────────────────────────────────────────────────────────────────────────────
 
-@router.get("/so/customer")
+@router.get("/so/customer", dependencies=[Depends(require_module("so_analytics"))])
 def so_customer_analytics(
     name: str = Query(..., description="Customer company_name"),
     db: Session = Depends(get_db),

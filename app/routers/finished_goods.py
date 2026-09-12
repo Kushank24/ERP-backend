@@ -9,7 +9,7 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from ..db import get_db
-from ..deps import get_current_user
+from ..deps import get_current_user, require_module
 
 router = APIRouter(prefix="/finished-goods", tags=["finished-goods"])
 
@@ -63,7 +63,7 @@ def list_fg(
     return [dict(r) for r in rows]
 
 
-@router.post("", status_code=201)
+@router.post("", status_code=201, dependencies=[Depends(require_module("finished_goods"))])
 def create_fg(
     body: FinishedGoodCreate,
     db: Session = Depends(get_db),
@@ -115,7 +115,7 @@ def create_fg(
     return dict(r)
 
 
-@router.post("/{fg_id}/return-to-inventory", status_code=201)
+@router.post("/{fg_id}/return-to-inventory", status_code=201, dependencies=[Depends(require_module("finished_goods"))])
 def return_to_inventory(
     fg_id: int,
     body: ReturnToInventoryBody,

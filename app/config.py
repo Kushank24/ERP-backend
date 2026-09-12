@@ -36,13 +36,12 @@ class Settings(BaseSettings):
     # and as a fallback verifier.
     supabase_jwt_secret: str = ""
 
-    # Default role assigned to Supabase Auth users who do not have
-    # ``user_metadata.role`` or ``app_metadata.role`` set.
-    # For a private/single-tenant ERP set this to "admin" so every
-    # authenticated user gets full access unless explicitly restricted.
-    # Options: admin | manager | purchase_manager | sales_manager |
-    #          production_manager | inventory_clerk | viewer
-    supabase_default_role: str = "admin"
+    # Fallback role for an authenticated user whose ``app_users`` row carries
+    # no usable role. Must stay least-privilege: a missing or malformed role
+    # should never grant access. The authoritative role is ``app_users.role``.
+    # Options: admin | manager | operator | offer_maker | purchase_manager |
+    #          sales_manager | production_manager | inventory_clerk | viewer
+    supabase_default_role: str = "viewer"
 
     # ------------------------------------------------------------------ #
     # SMTP (bulk email campaigns)                                          #

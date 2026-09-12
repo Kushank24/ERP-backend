@@ -10,7 +10,7 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from ..db import get_db
-from ..deps import get_current_user
+from ..deps import get_current_user, require_module
 
 router = APIRouter(prefix="/sales-orders", tags=["sales-orders"])
 
@@ -143,7 +143,7 @@ def get_so(so_id: int, db: Session = Depends(get_db), user: dict = Depends(get_c
     return _serialize_so(db, so_id)
 
 
-@router.post("", status_code=201)
+@router.post("", status_code=201, dependencies=[Depends(require_module("sales_orders"))])
 def create_so(
     body: SalesOrderCreate,
     db: Session = Depends(get_db),
@@ -274,7 +274,7 @@ def create_so(
     return _serialize_so(db, so_id)
 
 
-@router.patch("/{so_id}")
+@router.patch("/{so_id}", dependencies=[Depends(require_module("sales_orders"))])
 def update_so(
     so_id: int,
     body: SalesOrderUpdate,
@@ -365,7 +365,7 @@ class PaymentUpdate(BaseModel):
     payment_status: int = Field(ge=1, le=3)
     payment_amount: Optional[float] = Field(default=None, ge=0)
 
-@router.patch("/{so_id}/payment")
+@router.patch("/{so_id}/payment", dependencies=[Depends(require_module("sales_orders"))])
 def update_payment(so_id: int, body: PaymentUpdate, db: Session = Depends(get_db), user: dict = Depends(get_current_user)):
     _ = user
     row = db.execute(text("SELECT id, total_amount FROM sales_orders WHERE id = :id"), {"id": so_id}).first()
@@ -391,7 +391,7 @@ class AdditionalCostItem(BaseModel):
 class AdditionalCostsBody(BaseModel):
     items: List[AdditionalCostItem] = Field(default_factory=list)
 
-@router.patch("/{so_id}/additional-costs")
+@router.patch("/{so_id}/additional-costs", dependencies=[Depends(require_module("sales_orders"))])
 def update_additional_costs(so_id: int, body: AdditionalCostsBody, db: Session = Depends(get_db), user: dict = Depends(get_current_user)):
     _ = user
     row = db.execute(
@@ -424,7 +424,7 @@ class DispatchItem(BaseModel):
 class DispatchCreate(BaseModel):
     items: List[DispatchItem]
 
-@router.post("/{so_id}/dispatch")
+@router.post("/{so_id}/dispatch", dependencies=[Depends(require_module("sales_orders"))])
 def dispatch_so(so_id: int, body: DispatchCreate, db: Session = Depends(get_db), user: dict = Depends(get_current_user)):
     _ = user
     po_row = db.execute(
@@ -508,7 +508,7 @@ def dispatch_so(so_id: int, body: DispatchCreate, db: Session = Depends(get_db),
     return _serialize_so(db, so_id)
 
 
-@router.delete("/{so_id}", status_code=204)
+@router.delete("/{so_id}", status_code=204, dependencies=[Depends(require_module("sales_orders"))])
 def delete_so(so_id: int, db: Session = Depends(get_db), user: dict = Depends(get_current_user)):
     _ = user
     if not db.execute(text("SELECT id FROM sales_orders WHERE id = :id"), {"id": so_id}).first():

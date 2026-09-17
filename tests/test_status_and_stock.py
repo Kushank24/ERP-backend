@@ -257,6 +257,50 @@ def test_completion_locks_material_rows_before_deducting():
     assert "FOR UPDATE" in body
 
 
+def test_completion_rejects_units_it_cannot_convert():
+    """
+    A BOQ line in Meter against a material held in Kg used to fall through to
+    the raw quantity, deducting a number in the wrong unit. 39 such lines exist
+    across 21 products; silently corrupting stock is worse than refusing, since
+    no later report can detect it.
+    """
+    body = _body(WO_SRC, "patch_status")
+    assert "unconvertible" in body
+    assert "cannot be \n" not in body  # message must not be split mid-word
+    assert "consumed from the material's stock unit" in body
+
+
+def test_completion_names_the_offending_material_and_units():
+    """A refusal is only actionable if it says which line to fix."""
+    body = _body(WO_SRC, "patch_status")
+    assert "BOQ in {boq_unit" in body
+    assert "stock in {inv_unit" in body
+
+
+def test_completion_no_longer_falls_back_to_raw_quantity():
+    body = _body(WO_SRC, "patch_status")
+    assert "else raw_deduction" not in body
+
+
+PO_SRC = (BACKEND / "app" / "routers" / "purchase_orders.py").read_text()
+
+
+def test_goods_receipt_keeps_the_raw_quantity_and_warns():
+    """
+    Deliberate asymmetry with work-order completion: the goods have physically
+    arrived, so refusing the receipt would leave the PO open and inventory
+    understated. Record it and log the mismatch instead.
+    """
+    assert "_receipt_qty" in PO_SRC
+    assert "logger.warning" in PO_SRC
+    assert "Unit mismatch on goods receipt" in PO_SRC
+
+
+def test_goods_receipt_helper_is_used_by_both_receive_paths():
+    """status->4 auto-receive and POST /receive must behave identically."""
+    assert PO_SRC.count("_receipt_qty(") == 3  # definition + two call sites
+
+
 def test_reopening_a_completed_work_order_is_refused():
     """
     Completion consumes materials and produces goods with no reversal, and the

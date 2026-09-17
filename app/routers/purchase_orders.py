@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from datetime import date
 from typing import List, Optional
 
@@ -15,7 +16,54 @@ from ..deps import get_current_user, require_module
 from ..pdf_service import PDFGenerationService
 from ..unit_conversion import convert_qty as _convert_qty
 
+logger = logging.getLogger(__name__)
+
 _pdf_svc = PDFGenerationService()
+
+
+def _receipt_qty(
+    qty: float,
+    po_unit: str,
+    inv_unit: str,
+    material: str,
+    warnings: Optional[List[dict]] = None,
+) -> float:
+    """
+    Convert a received quantity into the material's stock unit.
+
+    Unlike work-order completion — which refuses when the units cannot be
+    reconciled — a goods receipt keeps the raw quantity. The goods have
+    physically arrived; refusing to record them would leave the PO open and
+    inventory understated, which is worse than recording a quantity whose unit
+    needs review.
+
+    The mismatch is both logged and appended to ``warnings``, which the
+    endpoint returns as ``unit_warnings`` so the person doing the receipt sees
+    it immediately rather than it sitting unread in a server log.
+    """
+    converted = _convert_qty(qty, po_unit, inv_unit)
+    if converted is not None:
+        return converted
+
+    logger.warning(
+        "Unit mismatch on goods receipt for %r: PO unit %r cannot convert to "
+        "stock unit %r. Recorded %s as-is — review this material's units.",
+        material, po_unit, inv_unit, qty,
+    )
+    if warnings is not None:
+        warnings.append({
+            "material": material,
+            "po_unit": po_unit or "(blank)",
+            "stock_unit": inv_unit or "(blank)",
+            "quantity": qty,
+            "message": (
+                f"{material}: received in {po_unit or '(blank)'} but stock is "
+                f"held in {inv_unit or '(blank)'}. These units measure "
+                f"different things, so {qty:g} was added as-is without "
+                f"conversion — the stock figure for this material needs review."
+            ),
+        })
+    return qty
 
 router = APIRouter(prefix="/purchase-orders", tags=["purchase-orders"])
 
@@ -348,6 +396,8 @@ def patch_po_status(
     if current_status is None:
         raise HTTPException(404, "Purchase order not found")
 
+    unit_warnings: List[dict] = []
+
     if current_status != 4 and body.status == 4:
         po_lines = db.execute(
             text("SELECT id, material_name, length_weight_nos, delivered_qty, unit, per_unit_cost FROM purchase_order_lines WHERE purchase_order_id = :id"),
@@ -369,8 +419,7 @@ def patch_po_status(
                 ).mappings().first()
                 if existing_mat:
                     inv_unit = (existing_mat["unit"] or "").strip()
-                    converted = _convert_qty(pending_qty, po_unit, inv_unit)
-                    add_qty = converted if converted is not None else pending_qty
+                    add_qty = _receipt_qty(pending_qty, po_unit, inv_unit, mat_name, unit_warnings)
                     db.execute(
                         text(
                             "UPDATE materials SET length_weight_nos = length_weight_nos + :qty, "
@@ -395,7 +444,9 @@ def patch_po_status(
         {"s": body.status, "id": po_id},
     )
     db.commit()
-    return _serialize_po(db, po_id)
+    result = _serialize_po(db, po_id)
+    result["unit_warnings"] = unit_warnings
+    return result
 
 
 class PoReceiveItem(BaseModel):
@@ -428,6 +479,8 @@ def receive_po_items(
         {"id": po_id}
     ).mappings().all()}
 
+    unit_warnings: List[dict] = []
+
     for item in body.items:
         if item.receive_qty <= 0: continue
         line = lines_map.get(item.line_id)
@@ -444,8 +497,7 @@ def receive_po_items(
         ).mappings().first()
         if existing_mat:
             inv_unit = (existing_mat["unit"] or "").strip()
-            converted = _convert_qty(receive_qty, po_unit, inv_unit)
-            add_qty = converted if converted is not None else receive_qty
+            add_qty = _receipt_qty(receive_qty, po_unit, inv_unit, mat_name, unit_warnings)
             db.execute(
                 text(
                     "UPDATE materials SET length_weight_nos = length_weight_nos + :qty, "
@@ -493,7 +545,9 @@ def receive_po_items(
         )
 
     db.commit()
-    return _serialize_po(db, po_id)
+    result = _serialize_po(db, po_id)
+    result["unit_warnings"] = unit_warnings
+    return result
 
 
 class AdditionalCostItem(BaseModel):

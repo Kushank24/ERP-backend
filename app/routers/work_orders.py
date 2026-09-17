@@ -353,6 +353,7 @@ def patch_status(
         # we never apply a partial deduction and then fail half way through.
         needed: dict[int, dict] = {}
         unknown_materials: list[str] = []
+        unconvertible: dict[str, str] = {}
 
         for p in wo["products"]:
             boq_lines = db.execute(
@@ -388,7 +389,20 @@ def patch_status(
 
                 inv_unit = (existing_mat["unit"] or "").strip()
                 converted = convert_qty(raw_deduction, boq_unit, inv_unit)
-                deduction = converted if converted is not None else raw_deduction
+
+                if converted is None:
+                    # The BOQ unit and the stock unit measure different things
+                    # (Meter vs Kg), or one of them is a count that only
+                    # matches itself (Nos vs Set). This used to fall through to
+                    # `raw_deduction`, deducting a number in the wrong unit —
+                    # which silently corrupts stock in a way no later report
+                    # can detect. Collect and refuse instead.
+                    unconvertible[str(existing_mat["name"])] = (
+                        f"BOQ in {boq_unit or '(blank)'}, stock in {inv_unit or '(blank)'}"
+                    )
+                    continue
+
+                deduction = converted
 
                 entry = needed.setdefault(
                     existing_mat["id"],
@@ -408,6 +422,18 @@ def patch_status(
                 "Cannot complete: these bill-of-quantities materials are not in "
                 f"inventory, so their consumption cannot be recorded — {names}. "
                 "Add them to inventory (or correct the BOQ material name) first.",
+            )
+
+        if unconvertible:
+            detail = "; ".join(
+                f"{name}: {mismatch}" for name, mismatch in sorted(unconvertible.items())
+            )
+            raise HTTPException(
+                400,
+                "Cannot complete: these bill-of-quantities lines cannot be "
+                f"consumed from the material's stock unit — {detail}. "
+                "Correct the BOQ unit or the material's unit so the two measure "
+                "the same thing.",
             )
 
         short = [

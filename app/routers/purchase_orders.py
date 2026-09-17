@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from datetime import date
 from typing import List, Optional
 
@@ -15,7 +16,31 @@ from ..deps import get_current_user, require_module
 from ..pdf_service import PDFGenerationService
 from ..unit_conversion import convert_qty as _convert_qty
 
+logger = logging.getLogger(__name__)
+
 _pdf_svc = PDFGenerationService()
+
+
+def _receipt_qty(qty: float, po_unit: str, inv_unit: str, material: str) -> float:
+    """
+    Convert a received quantity into the material's stock unit.
+
+    Unlike work-order completion — which refuses when the units cannot be
+    reconciled — a goods receipt keeps the raw quantity and logs a warning.
+    The goods have physically arrived; refusing to record them would leave the
+    PO open and inventory understated, which is worse than recording a
+    quantity whose unit needs review. The warning names the material so the
+    mismatch can be corrected.
+    """
+    converted = _convert_qty(qty, po_unit, inv_unit)
+    if converted is not None:
+        return converted
+    logger.warning(
+        "Unit mismatch on goods receipt for %r: PO unit %r cannot convert to "
+        "stock unit %r. Recorded %s as-is — review this material's units.",
+        material, po_unit, inv_unit, qty,
+    )
+    return qty
 
 router = APIRouter(prefix="/purchase-orders", tags=["purchase-orders"])
 
@@ -369,8 +394,7 @@ def patch_po_status(
                 ).mappings().first()
                 if existing_mat:
                     inv_unit = (existing_mat["unit"] or "").strip()
-                    converted = _convert_qty(pending_qty, po_unit, inv_unit)
-                    add_qty = converted if converted is not None else pending_qty
+                    add_qty = _receipt_qty(pending_qty, po_unit, inv_unit, mat_name)
                     db.execute(
                         text(
                             "UPDATE materials SET length_weight_nos = length_weight_nos + :qty, "
@@ -444,8 +468,7 @@ def receive_po_items(
         ).mappings().first()
         if existing_mat:
             inv_unit = (existing_mat["unit"] or "").strip()
-            converted = _convert_qty(receive_qty, po_unit, inv_unit)
-            add_qty = converted if converted is not None else receive_qty
+            add_qty = _receipt_qty(receive_qty, po_unit, inv_unit, mat_name)
             db.execute(
                 text(
                     "UPDATE materials SET length_weight_nos = length_weight_nos + :qty, "

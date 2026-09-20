@@ -75,6 +75,12 @@ REMINDER_AGE_DAYS = 15
 # permission-denied page instead of the catalogue.
 CATALOGUE_URL = "https://drive.google.com/file/d/1qwHrGsl_DhJABAflvZilXZCb0gPiUnfe/view?usp=sharing"
 
+# Blind-copied on every reminder so there is a record of exactly what each
+# customer received (subject, body, attached PDF) sitting in a normal inbox
+# — this is the address the FROM header already uses, so replies also land
+# here regardless of this setting.
+INTERNAL_BCC = "esafe@esafe.co.in"
+
 
 @dataclass
 class OfferRow:
@@ -331,7 +337,9 @@ def run(dry_run: bool) -> int:
 
             try:
                 attachments = _build_attachments(batch, offer_details)
-                send_transactional_email(batch.company_email, subject, html, attachments)
+                send_transactional_email(
+                    batch.company_email, subject, html, attachments, bcc=INTERNAL_BCC
+                )
             except Exception as exc:
                 failures += 1
                 logger.error(

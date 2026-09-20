@@ -288,11 +288,15 @@ def _send_single_via_smtp(
     subject: str,
     html: str,
     attachments: Optional[List[Tuple[str, bytes, str]]] = None,
+    bcc: Optional[str] = None,
 ) -> None:
     msg = MIMEMultipart("mixed") if attachments else MIMEMultipart("alternative")
     msg["Subject"] = subject
     msg["From"] = settings.smtp_user
     msg["To"] = to_email
+    # Bcc is deliberately not set as a header — a Bcc header would defeat its
+    # own purpose by revealing the address to the primary recipient. It is
+    # only added to the SMTP envelope recipient list below.
     msg.attach(MIMEText(html, "html"))
 
     for filename, file_bytes, mime_type in attachments or []:
@@ -301,6 +305,8 @@ def _send_single_via_smtp(
         part.add_header("Content-Disposition", "attachment", filename=filename)
         msg.attach(part)
 
+    envelope_recipients = [to_email] + ([bcc] if bcc else [])
+
     if settings.smtp_port == 465:
         smtp = smtplib.SMTP_SSL(settings.smtp_host, settings.smtp_port, timeout=30)
     else:
@@ -308,7 +314,7 @@ def _send_single_via_smtp(
         smtp.starttls()
     try:
         smtp.login(settings.smtp_user, settings.smtp_password)
-        smtp.sendmail(settings.smtp_user, [to_email], msg.as_string())
+        smtp.sendmail(settings.smtp_user, envelope_recipients, msg.as_string())
     finally:
         try:
             smtp.quit()
@@ -321,6 +327,7 @@ def send_transactional_email(
     subject: str,
     html: str,
     attachments: Optional[List[Tuple[str, bytes, str]]] = None,
+    bcc: Optional[str] = None,
 ) -> None:
     """
     Send one email now, using whichever provider EMAIL_PROVIDER selects
@@ -329,6 +336,8 @@ def send_transactional_email(
 
     attachments: (filename, bytes, mime_type) — plain file attachments (e.g.
     the offer PDF), distinct from the campaign editor's inline cid: images.
+    bcc: a single address to blind-copy (e.g. an internal record-keeping
+    inbox). Not visible to to_email in either provider path.
     """
     provider = settings.email_provider.lower()
     if provider == "resend":
@@ -343,9 +352,9 @@ def send_transactional_email(
         use_resend = False
 
     if use_resend:
-        _send_via_resend(to_email, subject, html, [], None, None, None, attachments)
+        _send_via_resend(to_email, subject, html, [], None, None, bcc, attachments)
     else:
-        _send_single_via_smtp(to_email, subject, html, attachments)
+        _send_single_via_smtp(to_email, subject, html, attachments, bcc)
 
 
 def resend_diagnostics(probe: bool = True) -> dict:

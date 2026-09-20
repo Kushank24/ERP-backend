@@ -19,6 +19,7 @@ import pytest
 
 from app.jobs.offer_reminders import (
     CATALOGUE_URL,
+    INTERNAL_BCC,
     REMINDER_AGE_DAYS,
     _MARK_SENT_SQL,
     CompanyBatch,
@@ -480,3 +481,34 @@ def test_send_receives_a_pdf_attachment(mock_send, mock_session, mock_serialize,
     assert attachments is not None
     assert len(attachments) == 1
     assert attachments[0][0] == "Offer-ES-1.pdf"
+
+
+@patch("app.jobs.offer_reminders._pdf_svc")
+@patch("app.jobs.offer_reminders._serialize")
+@patch("app.jobs.offer_reminders.SessionLocal")
+@patch("app.jobs.offer_reminders.send_transactional_email")
+def test_send_is_bcc_d_to_the_internal_record_address(mock_send, mock_session, mock_serialize, mock_pdf_svc):
+    """
+    Every reminder is BCC'd internally so there's a record, in a normal
+    inbox, of exactly what each customer received.
+    """
+    db = MagicMock()
+    mock_session.return_value.__enter__.return_value = db
+    db.execute.return_value.mappings.return_value.all.return_value = [_candidate_row(1)]
+    mock_serialize.return_value = {"id": 1, "offer_number": "ES/1", "offer_date": "2026-09-05",
+                                    "total_amount": 100.0, "items": []}
+    mock_pdf_svc.generate_offer_pdf.return_value = io.BytesIO(b"%PDF-fake")
+
+    run(dry_run=False)
+
+    _, _, kwargs = mock_send.mock_calls[0]
+    assert kwargs.get("bcc") == INTERNAL_BCC
+
+
+def test_internal_bcc_is_the_esafe_mailbox():
+    """
+    Pinned to catch an accidental change to the wrong address — this must
+    stay the mailbox whose MX records and Resend sender verification are
+    already set up, or the bcc copy silently goes nowhere.
+    """
+    assert INTERNAL_BCC == "esafe@esafe.co.in"

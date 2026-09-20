@@ -12,6 +12,7 @@ import logging
 import mimetypes
 import re
 import smtplib
+import socket
 import threading
 import time
 import urllib.error
@@ -74,6 +75,92 @@ def _delete_image_files(paths: List[Path]) -> None:
 
 # ── Resend HTTP API sender ────────────────────────────────────────────────────
 
+RESEND_ENDPOINT = "https://api.resend.com/emails"
+
+# Cloudflare sits in front of api.resend.com and answers 403 with its own
+# numeric codes, which look like Resend errors but are not — the request never
+# reached Resend. Distinguishing the two is the difference between "fix your
+# sender domain" and "fix your egress".
+_CLOUDFLARE_HINTS = {
+    "1010": (
+        "Cloudflare blocked the request based on the client signature (error "
+        "1010) — it never reached Resend, so this is not an API-key or "
+        "sender-domain problem. Usually the User-Agent or the TLS fingerprint "
+        "of Python's urllib. Try RESEND_USER_AGENT with a conventional value, "
+        "or switch this sender to the official resend SDK / httpx."
+    ),
+    "1020": (
+        "Cloudflare firewall rule denied the request (error 1020). The host's "
+        "outbound IP is likely blocked or geo-filtered."
+    ),
+    "1015": "Cloudflare rate-limited the request (error 1015). Slow the send rate.",
+}
+
+
+def _header(headers: dict, name: str) -> Optional[str]:
+    """
+    Case-insensitive header lookup.
+
+    HTTP header names are case-insensitive, and what comes back here is a plain
+    dict built from the response. Resend/Cloudflare send ``CF-RAY``, so a
+    lowercase-only ``.get("cf-ray")`` silently returned None and the Ray ID —
+    the one identifier support asks for — was dropped.
+    """
+    if not headers:
+        return None
+    lowered = {str(k).lower(): v for k, v in headers.items()}
+    return lowered.get(name.lower())
+
+
+def _describe_resend_failure(status: int, body: str, headers: dict) -> str:
+    """
+    Build a diagnosis from a failed Resend call.
+
+    Includes the Cloudflare Ray ID when present — that is the first thing
+    Cloudflare or Resend support will ask for, and it is invisible in the
+    current logs.
+    """
+    bits = [f"HTTP {status}"]
+
+    cf_code = None
+    m = re.search(r"error code:\s*(\d+)", body or "")
+    if m:
+        cf_code = m.group(1)
+
+    ray = _header(headers, "cf-ray")
+    server = _header(headers, "server")
+    if ray:
+        bits.append(f"cf-ray={ray}")
+    if server:
+        bits.append(f"server={server}")
+
+    if cf_code:
+        bits.append(f"cloudflare={cf_code}")
+        hint = _CLOUDFLARE_HINTS.get(
+            cf_code, f"Cloudflare denied the request (error {cf_code}) before it reached Resend."
+        )
+    elif status == 401:
+        hint = (
+            "Resend rejected the API key. Check RESEND_API_KEY is set in the "
+            "hosting environment (not only in local .env) and has not been revoked."
+        )
+    elif status == 403:
+        hint = (
+            "Resend refused the request. The most common cause is an unverified "
+            "sender domain — the 'from' address domain must be verified in the "
+            "Resend dashboard."
+        )
+    elif status == 422:
+        hint = "Resend rejected the payload — check the 'from' address and recipient format."
+    elif status == 429:
+        hint = "Resend rate limit hit. Increase SMTP_DELAY_SECONDS."
+    else:
+        hint = "Unexpected response from Resend."
+
+    snippet = (body or "").strip().replace("\n", " ")[:300]
+    return f"{' '.join(bits)}: {snippet} | {hint}"
+
+
 def _send_via_resend(
     to_email: str,
     subject: str,
@@ -106,23 +193,210 @@ def _send_via_resend(
             for cid, img_bytes, _ in inline_images
         ]
 
+    body_bytes = json.dumps(payload).encode()
     req = urllib.request.Request(
-        "https://api.resend.com/emails",
-        data=json.dumps(payload).encode(),
+        RESEND_ENDPOINT,
+        data=body_bytes,
         headers={
             "Authorization": f"Bearer {settings.resend_api_key}",
             "Content-Type": "application/json",
-            "User-Agent": "esafe-erp/1.0",
+            "Accept": "application/json",
+            # A conventional User-Agent. The previous value ("esafe-erp/1.0")
+            # coincided with Cloudflare 1010 blocks in production; Cloudflare
+            # scores unusual agents as automated clients. Override with
+            # RESEND_USER_AGENT if this needs tuning without a deploy.
+            "User-Agent": settings.resend_user_agent,
+        },
+        method="POST",
+    )
+
+    logger.debug(
+        "Resend POST %s from=%r to=%r attachments=%d payload_bytes=%d ua=%r",
+        RESEND_ENDPOINT, from_email, to_email,
+        len(payload.get("attachments") or []), len(body_bytes),
+        settings.resend_user_agent,
+    )
+
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            raw = resp.read().decode("utf-8", "replace")
+            if resp.status not in (200, 201):
+                detail = _describe_resend_failure(resp.status, raw, dict(resp.headers))
+                logger.error("Resend rejected message to %s — %s", to_email, detail)
+                raise RuntimeError(detail)
+            logger.debug("Resend accepted message to %s: %s", to_email, raw[:200])
+
+    except urllib.error.HTTPError as exc:
+        raw = ""
+        try:
+            raw = exc.read().decode("utf-8", "replace")
+        except Exception:  # pragma: no cover - body already consumed
+            pass
+        detail = _describe_resend_failure(exc.code, raw, dict(exc.headers or {}))
+        logger.error(
+            "Resend rejected message to %s (from=%r) — %s", to_email, from_email, detail
+        )
+        raise RuntimeError(detail) from exc
+
+    except urllib.error.URLError as exc:
+        # DNS failure, TLS failure, no route, connection refused. Previously
+        # this surfaced only as "<urlopen error ...>" with no context — and
+        # campaign 10 failed exactly here with "[Errno 101] Network is
+        # unreachable", which says nothing about what was being reached.
+        detail = (
+            f"Could not reach {RESEND_ENDPOINT}: {exc.reason!r}. "
+            "The host cannot open an outbound HTTPS connection to Resend — "
+            "check egress rules, DNS, and whether the platform requires IPv4 "
+            "(Errno 101 'Network is unreachable' usually means an IPv6 route "
+            "was attempted with no IPv6 connectivity)."
+        )
+        logger.error("Resend unreachable for %s — %s", to_email, detail)
+        raise RuntimeError(detail) from exc
+
+    except socket.timeout as exc:
+        detail = f"Resend did not respond within 30s ({RESEND_ENDPOINT})."
+        logger.error("Resend timeout for %s — %s", to_email, detail)
+        raise RuntimeError(detail) from exc
+
+
+def resend_diagnostics(probe: bool = True) -> dict:
+    """
+    Report how email sending is configured, and optionally make one live call
+    to Resend to see what actually happens.
+
+    Built because the failure was invisible: the reason was being written to
+    ``email_campaign_failures.error`` but nothing surfaced it, and the app had
+    no logging configuration so INFO lines never appeared either. Hitting this
+    from the hosting environment answers the question in one request.
+
+    Never returns the API key — only whether it is present, its length, and
+    its prefix, which is enough to tell "not set in this environment" from
+    "set but wrong".
+    """
+    key = settings.resend_api_key or ""
+    from_email = settings.resend_from_email or settings.smtp_user or ""
+    provider = (settings.email_provider or "auto").lower()
+
+    if provider == "resend":
+        chosen = "resend"
+    elif provider == "smtp":
+        chosen = "smtp"
+    else:
+        chosen = "resend" if key else "smtp"
+
+    result: dict = {
+        "email_provider_setting": provider,
+        "provider_that_would_be_used": chosen,
+        "resend_api_key_present": bool(key),
+        "resend_api_key_length": len(key),
+        "resend_api_key_prefix": (key[:6] + "…") if key else None,
+        "resend_api_key_format_looks_valid": key.startswith("re_") and len(key) > 20,
+        "from_address": from_email or None,
+        "from_address_source": (
+            "RESEND_FROM_EMAIL" if settings.resend_from_email
+            else ("SMTP_USER (fallback)" if settings.smtp_user else "unset")
+        ),
+        "from_domain": from_email.split("@")[-1] if "@" in from_email else None,
+        "user_agent": settings.resend_user_agent,
+        "endpoint": RESEND_ENDPOINT,
+        "smtp_host": settings.smtp_host,
+        "smtp_user_present": bool(settings.smtp_user),
+        "delay_seconds": settings.smtp_delay_seconds,
+        "probe": None,
+    }
+
+    warnings: List[str] = []
+    if chosen == "resend" and not key:
+        warnings.append("EMAIL_PROVIDER=resend but RESEND_API_KEY is empty in this environment.")
+    if key and not result["resend_api_key_format_looks_valid"]:
+        warnings.append("RESEND_API_KEY does not look like a Resend key (expected 're_' prefix).")
+    if not from_email:
+        warnings.append("No from address: set RESEND_FROM_EMAIL (or SMTP_USER).")
+    if result["from_domain"] in {"gmail.com", "yahoo.com", "outlook.com", "hotmail.com"}:
+        warnings.append(
+            f"From domain '{result['from_domain']}' is a public mailbox provider and cannot "
+            "be verified in Resend. Use an address on a domain you own and have verified."
+        )
+    result["warnings"] = warnings
+
+    if not probe:
+        return result
+
+    # Live probe: DNS + TCP + TLS + one authenticated request. Deliberately
+    # posts an invalid payload (empty recipient list) so nothing is delivered —
+    # we only care whether we get *a Resend answer* rather than a Cloudflare
+    # block or a network error.
+    probe_result: dict = {"stage": "dns"}
+    try:
+        infos = socket.getaddrinfo("api.resend.com", 443, proto=socket.IPPROTO_TCP)
+        probe_result["resolved_addresses"] = sorted(
+            {i[4][0] for i in infos}
+        )[:6]
+        probe_result["has_ipv4"] = any(i[0] == socket.AF_INET for i in infos)
+        probe_result["has_ipv6"] = any(i[0] == socket.AF_INET6 for i in infos)
+    except Exception as exc:
+        probe_result["stage"] = "dns_failed"
+        probe_result["error"] = repr(exc)
+        result["probe"] = probe_result
+        return result
+
+    probe_result["stage"] = "http"
+    req = urllib.request.Request(
+        RESEND_ENDPOINT,
+        data=json.dumps({"from": from_email, "to": [], "subject": "", "html": ""}).encode(),
+        headers={
+            "Authorization": f"Bearer {key}",
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "User-Agent": settings.resend_user_agent,
         },
         method="POST",
     )
     try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            if resp.status not in (200, 201):
-                raise RuntimeError(f"Resend {resp.status}: {resp.read().decode()[:200]}")
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            probe_result.update(
+                stage="reached_resend",
+                status=resp.status,
+                cf_ray=_header(dict(resp.headers), "cf-ray"),
+                server=_header(dict(resp.headers), "server"),
+                body=resp.read().decode("utf-8", "replace")[:300],
+                verdict="Reached Resend and it answered.",
+            )
     except urllib.error.HTTPError as exc:
-        body = exc.read().decode()[:500]
-        raise RuntimeError(f"Resend HTTP {exc.code}: {body}") from exc
+        raw = ""
+        try:
+            raw = exc.read().decode("utf-8", "replace")
+        except Exception:
+            pass
+        headers = dict(exc.headers or {})
+        cf_code = re.search(r"error code:\s*(\d+)", raw or "")
+        blocked = bool(cf_code)
+        probe_result.update(
+            stage="cloudflare_blocked" if blocked else "reached_resend",
+            status=exc.code,
+            cf_ray=_header(headers, "cf-ray"),
+            server=_header(headers, "server"),
+            cloudflare_error=cf_code.group(1) if cf_code else None,
+            body=(raw or "").strip().replace("\n", " ")[:300],
+            verdict=_describe_resend_failure(exc.code, raw, headers),
+        )
+        # 401/422 from Resend itself still proves connectivity is fine.
+        if not blocked and exc.code in (401, 422, 400):
+            probe_result["connectivity"] = "ok — Resend answered, so DNS/TLS/egress all work"
+    except urllib.error.URLError as exc:
+        probe_result.update(
+            stage="network_unreachable",
+            error=repr(exc.reason),
+            verdict=(
+                "Could not open an outbound HTTPS connection to api.resend.com. "
+                "Check egress/firewall rules and IPv6 availability."
+            ),
+        )
+    except socket.timeout:
+        probe_result.update(stage="timeout", verdict="No response within 15s.")
+
+    result["probe"] = probe_result
+    return result
 
 
 # ── DB helpers ────────────────────────────────────────────────────────────────

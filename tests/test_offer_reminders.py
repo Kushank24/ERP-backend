@@ -228,14 +228,14 @@ def test_single_offer_subject_names_the_offer():
     offer = _offer()
     batch = CompanyBatch(1, "Acme", "a@b.com", "Mr X", [offer])
     subject, _ = _build_email(batch, {offer.id: _detail(offer)})
-    assert subject == "Following up on Offer ES/26-27/A-1/0001"
+    assert subject == "Following up on Offer ES/26-27/A-1/0001 from E-SAFE"
 
 
 def test_multi_offer_subject_gives_a_count():
     o1, o2 = _offer(id=1, offer_number="ES/1"), _offer(id=2, offer_number="ES/2")
     batch = CompanyBatch(1, "Acme", "a@b.com", "Mr X", [o1, o2])
     subject, _ = _build_email(batch, {1: _detail(o1), 2: _detail(o2)})
-    assert subject == "Following up on 2 open offers"
+    assert subject == "Following up on 2 open offers from E-SAFE"
 
 
 def test_multi_offer_email_renders_a_section_per_offer():

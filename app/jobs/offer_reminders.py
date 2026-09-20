@@ -194,13 +194,13 @@ def _build_email(
     plural = len(batch.offers) > 1
 
     if plural:
-        subject = f"Following up on {len(batch.offers)} open offers"
+        subject = f"Following up on {len(batch.offers)} open offers from E-SAFE"
         lead = (
             "This is a gentle reminder regarding the following offers we "
             "shared with you, which are still awaiting your response:"
         )
     else:
-        subject = f"Following up on Offer {batch.offers[0].offer_number}"
+        subject = f"Following up on Offer {batch.offers[0].offer_number} from E-SAFE"
         lead = (
             "This is a gentle reminder regarding the offer we shared with "
             "you, which is still awaiting your response:"

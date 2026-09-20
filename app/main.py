@@ -9,6 +9,7 @@ from sqlalchemy.exc import OperationalError, SQLAlchemyError
 
 from .config import settings
 from .deps import require_any_module
+from .logging_config import configure_logging
 from .routers import (
     analytics,
     auth,
@@ -25,6 +26,10 @@ from .routers import (
     sales_orders,
     work_orders,
 )
+
+# Must run before anything logs, so INFO-level messages are not dropped by
+# logging.lastResort. See app/logging_config.py for why this is needed.
+configure_logging()
 
 logger = logging.getLogger(__name__)
 

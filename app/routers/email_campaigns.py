@@ -315,6 +315,33 @@ def stop_campaign(campaign_id: int, db: Session = Depends(get_db), user: dict = 
     return {"stopped": True}
 
 
+@router.get("/diagnostics")
+def email_diagnostics(
+    probe: bool = True,
+    user: dict = Depends(get_current_user),
+):
+    """
+    Why is email failing here?
+
+    Reports the sending configuration as this process sees it, and (unless
+    ``probe=false``) makes one live call to Resend to distinguish the three
+    causes that look identical from the outside:
+
+      * config — key missing in this environment, or an unverifiable sender
+      * Cloudflare — request blocked before it ever reached Resend
+      * network  — the host cannot open an outbound HTTPS connection at all
+
+    The API key is never returned; only whether it is present, its length and
+    its prefix. Gated on the email_campaigns module like the rest of this
+    router, so it is not public.
+
+    Note ``/diagnostics`` is declared before ``/{campaign_id}`` so the literal
+    path is not captured by the int path parameter.
+    """
+    _ = user
+    return email_service.resend_diagnostics(probe=probe)
+
+
 @router.get("/{campaign_id}/failures")
 def get_failures(campaign_id: int, db: Session = Depends(get_db), user: dict = Depends(get_current_user)):
     _ = user

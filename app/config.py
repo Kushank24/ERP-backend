@@ -70,6 +70,15 @@ class Settings(BaseSettings):
     # Defaults to smtp_user if not set.
     resend_from_email: str = ""
 
+    # User-Agent sent to api.resend.com. Overridable without a deploy because
+    # Cloudflare (which fronts the Resend API) answered 403 / error 1010 to the
+    # previous value "esafe-erp/1.0" — it scores unusual agents as automated
+    # clients. Kept configurable so this can be tuned from the host's env.
+    resend_user_agent: str = (
+        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
+    )
+
     # Comma-separated list of Supabase user e-mail addresses that always
     # receive admin access, regardless of their metadata role.
     # Example:  SUPABASE_ADMIN_EMAILS=alice@example.com,bob@example.com

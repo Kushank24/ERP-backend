@@ -17,6 +17,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
+from email.mime.application import MIMEApplication
 from email.mime.image import MIMEImage
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
@@ -169,7 +170,15 @@ def _send_via_resend(
     reply_to: Optional[str],
     cc: Optional[str],
     bcc: Optional[str],
+    attachments: Optional[List[Tuple[str, bytes, str]]] = None,
 ) -> None:
+    """
+    inline_images: (content_id, bytes, mime_type) — embedded via cid: in the
+        HTML body (used by the bulk campaign editor's inline images).
+    attachments: (filename, bytes, mime_type) — a normal file attachment with
+        no content_id, so mail clients show it as a downloadable file rather
+        than rendering it inline (used to attach the offer PDF to a reminder).
+    """
     from_email = settings.resend_from_email or settings.smtp_user
     payload: dict = {
         "from": from_email,
@@ -183,15 +192,23 @@ def _send_via_resend(
         payload["cc"] = [a.strip() for a in cc.split(",") if a.strip()]
     if bcc:
         payload["bcc"] = [a.strip() for a in bcc.split(",") if a.strip()]
-    if inline_images:
-        payload["attachments"] = [
-            {
-                "content_id": cid,
-                "filename": f"{cid}.jpg",
-                "content": base64.b64encode(img_bytes).decode(),
-            }
-            for cid, img_bytes, _ in inline_images
-        ]
+
+    all_attachments = [
+        {
+            "content_id": cid,
+            "filename": f"{cid}.jpg",
+            "content": base64.b64encode(img_bytes).decode(),
+        }
+        for cid, img_bytes, _ in inline_images
+    ] + [
+        {
+            "filename": filename,
+            "content": base64.b64encode(file_bytes).decode(),
+        }
+        for filename, file_bytes, _ in (attachments or [])
+    ]
+    if all_attachments:
+        payload["attachments"] = all_attachments
 
     body_bytes = json.dumps(payload).encode()
     req = urllib.request.Request(
@@ -257,6 +274,87 @@ def _send_via_resend(
         detail = f"Resend did not respond within 30s ({RESEND_ENDPOINT})."
         logger.error("Resend timeout for %s — %s", to_email, detail)
         raise RuntimeError(detail) from exc
+
+
+# ── Single transactional email ────────────────────────────────────────────────
+# Used by scheduled jobs (e.g. app/jobs/offer_reminders.py) that send one email
+# per recipient outside the bulk-campaign flow — no campaign_id, no progress
+# tracking in email_campaigns, no CID image embedding. Respects the same
+# EMAIL_PROVIDER selection and the same Resend error classification as the
+# campaign path, so a job failure is diagnosable the same way.
+
+def _send_single_via_smtp(
+    to_email: str,
+    subject: str,
+    html: str,
+    attachments: Optional[List[Tuple[str, bytes, str]]] = None,
+    bcc: Optional[str] = None,
+) -> None:
+    msg = MIMEMultipart("mixed") if attachments else MIMEMultipart("alternative")
+    msg["Subject"] = subject
+    msg["From"] = settings.smtp_user
+    msg["To"] = to_email
+    # Bcc is deliberately not set as a header — a Bcc header would defeat its
+    # own purpose by revealing the address to the primary recipient. It is
+    # only added to the SMTP envelope recipient list below.
+    msg.attach(MIMEText(html, "html"))
+
+    for filename, file_bytes, mime_type in attachments or []:
+        maintype, _, subtype = (mime_type or "application/octet-stream").partition("/")
+        part = MIMEApplication(file_bytes, _subtype=subtype or "octet-stream")
+        part.add_header("Content-Disposition", "attachment", filename=filename)
+        msg.attach(part)
+
+    envelope_recipients = [to_email] + ([bcc] if bcc else [])
+
+    if settings.smtp_port == 465:
+        smtp = smtplib.SMTP_SSL(settings.smtp_host, settings.smtp_port, timeout=30)
+    else:
+        smtp = smtplib.SMTP(settings.smtp_host, settings.smtp_port, timeout=30)
+        smtp.starttls()
+    try:
+        smtp.login(settings.smtp_user, settings.smtp_password)
+        smtp.sendmail(settings.smtp_user, envelope_recipients, msg.as_string())
+    finally:
+        try:
+            smtp.quit()
+        except Exception:
+            pass
+
+
+def send_transactional_email(
+    to_email: str,
+    subject: str,
+    html: str,
+    attachments: Optional[List[Tuple[str, bytes, str]]] = None,
+    bcc: Optional[str] = None,
+) -> None:
+    """
+    Send one email now, using whichever provider EMAIL_PROVIDER selects
+    (same auto/resend/smtp logic as bulk campaigns). Raises on failure — the
+    caller decides what "failed" means for that job (skip, retry, log).
+
+    attachments: (filename, bytes, mime_type) — plain file attachments (e.g.
+    the offer PDF), distinct from the campaign editor's inline cid: images.
+    bcc: a single address to blind-copy (e.g. an internal record-keeping
+    inbox). Not visible to to_email in either provider path.
+    """
+    provider = settings.email_provider.lower()
+    if provider == "resend":
+        use_resend = True
+    elif provider == "smtp":
+        use_resend = False
+    else:  # auto
+        use_resend = bool(settings.resend_api_key)
+
+    if use_resend and not settings.resend_api_key:
+        logger.error("EMAIL_PROVIDER=resend but RESEND_API_KEY is not set; falling back to SMTP")
+        use_resend = False
+
+    if use_resend:
+        _send_via_resend(to_email, subject, html, [], None, None, bcc, attachments)
+    else:
+        _send_single_via_smtp(to_email, subject, html, attachments, bcc)
 
 
 def resend_diagnostics(probe: bool = True) -> dict:

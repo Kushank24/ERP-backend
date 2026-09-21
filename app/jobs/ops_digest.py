@@ -183,13 +183,12 @@ def _build_digest(
     )
 
     delivery_table = _table(
-        ["Invoice", "Company", "Delivery Date", "Amount", "Dispatch Status"],
+        ["Invoice", "Company", "Delivery Date", "Dispatch Status"],
         [
             [
                 escape(str(d["invoice_number"])),
                 escape(str(d["company_name"] or "—")),
                 _fmt_date(d["delivery_date"]),
-                _fmt_money(float(d["total_amount"])),
                 escape(DISPATCH_STATUS_LABEL.get(d["dispatch_status"], "Unknown")),
             ]
             for d in deliveries

@@ -124,6 +124,17 @@ def test_delivery_section_shows_dispatch_status_label():
     assert "Fully Dispatched" in html
 
 
+def test_delivery_section_does_not_show_the_order_amount():
+    """
+    Explicit design decision: unpaid orders show amount (relevant to
+    collections); upcoming deliveries do not (it's a logistics list, not a
+    money one). Guards against the column silently coming back.
+    """
+    _, html = _build_digest([], [], [_delivery(amt=123456.78)])
+    delivery_section = html.split("3. Upcoming")[-1]
+    assert "₹" not in delivery_section
+
+
 def test_delivery_section_includes_already_dispatched_orders():
     """
     Explicit design decision: unlike the unpaid-orders section, this is a pure

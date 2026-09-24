@@ -16,6 +16,7 @@ from sqlalchemy.orm import Session
 from ..db import get_db
 from ..deps import get_current_user, require_module
 from ..config import settings
+from ..upload_limits import read_limited
 from .. import email_service
 
 # Uploaded images are stored alongside the backend package
@@ -125,11 +126,37 @@ _MAX_IMAGE_PX = 800   # max width/height in pixels
 _JPEG_QUALITY = 85    # JPEG compression quality
 
 
-def _compress_image(raw: bytes, ext: str) -> tuple[bytes, str]:
-    """Resize to max 800 px and re-encode as JPEG. Returns (bytes, new_ext)."""
+def _verify_is_image(raw: bytes) -> None:
+    """
+    Raise HTTPException(400) unless raw genuinely decodes as an image.
+
+    This used to only run for non-GIF extensions, and a Pillow decode
+    failure silently fell back to storing the raw, unvalidated bytes rather
+    than rejecting the upload — so a file named "x.gif", or any file Pillow
+    failed to parse, was written to disk and served publicly at
+    /images/{filename} with no content check at all. The filename extension
+    was never a real gate: it only picked which display label the browser
+    sees, not what bytes are actually accepted.
+    """
+    from PIL import Image
+    import io as _io
     try:
-        from PIL import Image
-        import io as _io
+        img = Image.open(_io.BytesIO(raw))
+        img.verify()
+    except Exception:
+        raise HTTPException(400, "File is not a valid image.")
+
+
+def _compress_image(raw: bytes, ext: str) -> tuple[bytes, str]:
+    """
+    Resize to max 800 px and re-encode as JPEG. Returns (bytes, new_ext).
+    Caller must have already validated `raw` via _verify_is_image — this
+    raises 400 rather than silently returning the unprocessed original if
+    Pillow rejects it anyway (e.g. a format it can identify but not decode).
+    """
+    from PIL import Image
+    import io as _io
+    try:
         img = Image.open(_io.BytesIO(raw))
         img = img.convert("RGB")
         w, h = img.size
@@ -140,7 +167,7 @@ def _compress_image(raw: bytes, ext: str) -> tuple[bytes, str]:
         img.save(buf, format="JPEG", quality=_JPEG_QUALITY, optimize=True)
         return buf.getvalue(), ".jpg"
     except Exception:
-        return raw, ext  # fall back to original if Pillow fails
+        raise HTTPException(400, "File is not a valid image.")
 
 
 @router.post("/upload-image", status_code=201, dependencies=[Depends(require_module("email_campaigns"))])
@@ -155,8 +182,12 @@ async def upload_image(
     allowed = {".jpg", ".jpeg", ".png", ".gif", ".webp"}
     if ext not in allowed:
         raise HTTPException(400, f"Unsupported image type: {ext}")
-    raw = await file.read()
-    # GIFs are kept as-is; everything else is compressed to JPEG
+    raw = await read_limited(file)
+    # Validated regardless of extension — the extension was never a real
+    # gate, only a display label; GIFs used to skip validation entirely here.
+    _verify_is_image(raw)
+    # GIFs are kept as-is (compressing would destroy the animation);
+    # everything else is compressed to JPEG.
     if ext not in (".gif",):
         raw, ext = _compress_image(raw, ext)
     filename = f"{uuid.uuid4().hex}{ext}"
@@ -182,7 +213,11 @@ def serve_image(filename: str):
     path = _UPLOAD_DIR / filename
     if not path.exists():
         raise HTTPException(404, "Image not found")
-    return FileResponse(str(path))
+    # Defense in depth on top of the upload-time content validation above:
+    # tells the browser not to guess a different content type from the
+    # bytes, so a file that somehow got stored with a mismatched extension
+    # can't be sniffed and rendered as something other than an image.
+    return FileResponse(str(path), headers={"X-Content-Type-Options": "nosniff"})
 
 
 @router.delete("/{campaign_id}", status_code=204, dependencies=[Depends(require_module("email_campaigns"))])
@@ -235,7 +270,7 @@ async def parse_contacts(
     user: dict = Depends(get_current_user),
 ):
     _ = user
-    content = await file.read()
+    content = await read_limited(file)
     filename = (file.filename or "").lower()
 
     if filename.endswith(".xlsx") or filename.endswith(".xls"):

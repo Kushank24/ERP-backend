@@ -16,6 +16,7 @@ from sqlalchemy.orm import Session
 from ..boq_math import total_quantity_consumed
 from ..db import get_db
 from ..deps import get_current_user, require_module
+from ..upload_limits import read_limited
 from ..pdf_service import PDFGenerationService
 
 router = APIRouter(prefix="/products", tags=["products"])
@@ -624,7 +625,7 @@ async def bulk_upload_products(
     user: dict = Depends(get_current_user),
 ):
     _ = user
-    content = await file.read()
+    content = await read_limited(file)
     filename = (file.filename or "").lower()
 
     rows: list[dict] = []

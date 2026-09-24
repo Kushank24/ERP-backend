@@ -13,8 +13,9 @@ Runs, in order:
      an open offer that turned exactly 15 days old today. BCC'd to
      esafe@esafe.co.in.
   2. app.jobs.ops_digest — one internal email to accounts@esafe.co.in
-     covering open work orders, sales orders that turned exactly 10 days old
-     unpaid today, and sales orders due for delivery in the next 5 days.
+     covering open work orders, all sales orders with a real unpaid status
+     (Not Received / Partially Received), and sales orders due for delivery
+     in the next 5 days.
 
 Each job's own module remains independently runnable (see their docstrings)
 for isolated testing — this module only sequences them and combines the exit

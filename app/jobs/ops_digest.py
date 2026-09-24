@@ -9,19 +9,22 @@ three sections:
                                  time this was built, so this is a genuine
                                  "what's still open" digest, not backlog spam.
 
-    2. Unpaid sales orders    — orders whose sales_date turned EXACTLY 10 days
-                                 old today and payment_status is not 3
-                                 (received). Same exact-day design as the
-                                 offer reminder (app/jobs/offer_reminders.py)
-                                 and for the same reason: the backlog of
-                                 already-unpaid orders 10+ days old is 753 rows
-                                 (mostly the legacy payment_status IS NULL
-                                 bulk-import rows), and a ">= 10 days" rule
-                                 would re-email that entire backlog every day
-                                 forever. sales_orders.payment_reminder_sent_at
-                                 (migration 010) is a same-day double-fire
-                                 guard on top of the exact-day match, not the
-                                 primary dedup mechanism.
+    2. Unpaid sales orders    — every order with payment_status IN (1, 2)
+                                 ("Not Received" / "Partially Received"), a
+                                 standing list like open work orders, not a
+                                 one-time alert. Deliberately excludes orders
+                                 where payment_status IS NULL: 713 orders from
+                                 the original bulk import were never given a
+                                 real payment status at all, and are not the
+                                 same thing as an order someone actually
+                                 assessed as unpaid — including them would
+                                 make this section 760 rows of mostly noise
+                                 instead of 47 rows of real signal. This
+                                 originally ran as an exact-day trigger (see
+                                 migration 010 / offers.reminder_sent_at for
+                                 that pattern) but was changed to a standing
+                                 list; payment_reminder_sent_at is no longer
+                                 written by this job.
 
     3. Upcoming deliveries    — orders with delivery_date within the next 5
                                  days (today through today+5 inclusive),
@@ -67,9 +70,12 @@ from ..logging_config import configure_logging
 
 logger = logging.getLogger(__name__)
 
-UNPAID_AGE_DAYS = 10
 DELIVERY_WINDOW_DAYS = 5
 DIGEST_RECIPIENT = "accounts@esafe.co.in"
+
+#: Real, assessed payment states only. Deliberately excludes NULL — see the
+#: module docstring for why (713 legacy bulk-import rows with no real status).
+UNPAID_PAYMENT_STATUSES = (1, 2)
 
 PAYMENT_STATUS_LABEL = {1: "Not Received", 2: "Partially Received", 3: "Received"}
 DISPATCH_STATUS_LABEL = {1: "Not Dispatched", 3: "Partial Dispatch", 4: "Fully Dispatched"}
@@ -88,10 +94,8 @@ _UNPAID_SALES_ORDERS_SQL = text(
     """
     SELECT id, invoice_number, company_name, sales_date, total_amount, payment_status
     FROM sales_orders
-    WHERE (payment_status IS NULL OR payment_status != 3)
-      AND sales_date = CURRENT_DATE - INTERVAL '1 day' * :age_days
-      AND payment_reminder_sent_at IS NULL
-    ORDER BY id
+    WHERE payment_status = ANY(:statuses)
+    ORDER BY sales_date ASC
     """
 )
 
@@ -102,10 +106,6 @@ _UPCOMING_DELIVERIES_SQL = text(
     WHERE delivery_date BETWEEN CURRENT_DATE AND CURRENT_DATE + INTERVAL '1 day' * :window_days
     ORDER BY delivery_date ASC
     """
-)
-
-_MARK_PAYMENT_REMINDED_SQL = text(
-    "UPDATE sales_orders SET payment_reminder_sent_at = now() WHERE id = ANY(:ids)"
 )
 
 
@@ -139,7 +139,9 @@ def _fetch_open_work_orders(db: Session) -> list[dict]:
 
 
 def _fetch_unpaid_sales_orders(db: Session) -> list[dict]:
-    rows = db.execute(_UNPAID_SALES_ORDERS_SQL, {"age_days": UNPAID_AGE_DAYS}).mappings().all()
+    rows = db.execute(
+        _UNPAID_SALES_ORDERS_SQL, {"statuses": list(UNPAID_PAYMENT_STATUSES)}
+    ).mappings().all()
     return [dict(r) for r in rows]
 
 
@@ -179,7 +181,7 @@ def _build_digest(
             ]
             for u in unpaid
         ],
-        f"No sales orders turned exactly {UNPAID_AGE_DAYS} days old and unpaid today.",
+        "No unpaid sales orders.",
     )
 
     delivery_table = _table(
@@ -203,7 +205,7 @@ def _build_digest(
       <p style="margin:16px 0 2px"><strong>1. Open Work Orders ({len(work_orders)})</strong></p>
       {wo_table}
 
-      <p style="margin:16px 0 2px"><strong>2. Unpaid Sales Orders — turned {UNPAID_AGE_DAYS} days old today ({len(unpaid)})</strong></p>
+      <p style="margin:16px 0 2px"><strong>2. Unpaid Sales Orders ({len(unpaid)})</strong></p>
       {unpaid_table}
 
       <p style="margin:16px 0 2px"><strong>3. Upcoming Deliveries — next {DELIVERY_WINDOW_DAYS} days ({len(deliveries)})</strong></p>
@@ -226,9 +228,9 @@ def run(dry_run: bool) -> int:
         deliveries = _fetch_upcoming_deliveries(db)
 
         logger.info(
-            "Ops digest: %d open work order(s), %d newly-unpaid sales order(s) "
-            "(exactly %d days old), %d delivery(ies) due within %d days",
-            len(work_orders), len(unpaid), UNPAID_AGE_DAYS, len(deliveries), DELIVERY_WINDOW_DAYS,
+            "Ops digest: %d open work order(s), %d unpaid sales order(s), "
+            "%d delivery(ies) due within %d days",
+            len(work_orders), len(unpaid), len(deliveries), DELIVERY_WINDOW_DAYS,
         )
 
         subject, html = _build_digest(work_orders, unpaid, deliveries)
@@ -244,13 +246,6 @@ def run(dry_run: bool) -> int:
             return 1
 
         logger.info("Ops digest sent to %s", DIGEST_RECIPIENT)
-
-        if unpaid:
-            ids = [u["id"] for u in unpaid]
-            db.execute(_MARK_PAYMENT_REMINDED_SQL, {"ids": ids})
-            db.commit()
-            logger.info("Marked %d sales order(s) as payment-reminded", len(ids))
-
         return 0
 
 

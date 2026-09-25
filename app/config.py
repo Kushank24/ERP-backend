@@ -84,6 +84,14 @@ class Settings(BaseSettings):
     # Example:  SUPABASE_ADMIN_EMAILS=alice@example.com,bob@example.com
     supabase_admin_emails: str = ""
 
+    # ------------------------------------------------------------------ #
+    # Cloudinary (sales order documents: invoice, e-way bill)              #
+    # ------------------------------------------------------------------ #
+    # From Cloudinary dashboard → Settings → API Keys.
+    cloudinary_cloud_name: str = ""
+    cloudinary_api_key: str = ""
+    cloudinary_api_secret: str = ""
+
     @property
     def supabase_admin_email_set(self) -> set[str]:
         """Lower-cased set of admin e-mails parsed from the env var."""

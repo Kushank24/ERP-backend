@@ -2,17 +2,27 @@ from __future__ import annotations
 
 import json
 from datetime import date
-from typing import List, Optional
+from typing import List, Literal, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
+from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel, Field
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
+from .. import cloudinary_service
 from ..db import get_db
 from ..deps import get_current_user, require_module
+from ..upload_limits import read_limited
 
 router = APIRouter(prefix="/sales-orders", tags=["sales-orders"])
+
+DocumentKind = Literal["invoice", "eway_bill", "lr_copy"]
+_DOCUMENT_COLUMN = {
+    "invoice": "invoice_document",
+    "eway_bill": "eway_bill_document",
+    "lr_copy": "lr_copy_document",
+}
 
 
 class SalesLineIn(BaseModel):
@@ -40,6 +50,12 @@ class SalesOrderCreate(BaseModel):
     delivery_details: dict = Field(default_factory=dict)
     notes: Optional[str] = None
     lines: List[SalesLineIn] = Field(min_length=1)
+    # Metadata returned by POST /sales-orders/upload-document — never a URL,
+    # since an authenticated Cloudinary asset has no permanent one. Both
+    # optional: each document can be attached after creation too.
+    invoice_document: Optional[dict] = None
+    eway_bill_document: Optional[dict] = None
+    lr_copy_document: Optional[dict] = None
 
 
 class SalesOrderUpdate(BaseModel):
@@ -53,6 +69,9 @@ class SalesOrderUpdate(BaseModel):
     delivery_details: dict = Field(default_factory=dict)
     notes: Optional[str] = None
     lines: List[SalesLineUpdate] = Field(min_length=1)
+    invoice_document: Optional[dict] = None
+    eway_bill_document: Optional[dict] = None
+    lr_copy_document: Optional[dict] = None
 
 
 def _serialize_so(db: Session, so_id: int) -> dict:
@@ -63,7 +82,8 @@ def _serialize_so(db: Session, so_id: int) -> dict:
                    sales_date, delivery_date, actual_delivery_date, total_amount, status, gst_rate,
                    payment_status, dispatch_status,
                    delivery_details, notes, created_at, updated_at, payment_received, payment_amount,
-                   COALESCE(additional_costs, '[]'::jsonb) AS additional_costs
+                   COALESCE(additional_costs, '[]'::jsonb) AS additional_costs,
+                   invoice_document, eway_bill_document, lr_copy_document
             FROM sales_orders WHERE id = :id
             """
         ),
@@ -87,11 +107,94 @@ def _serialize_so(db: Session, so_id: int) -> dict:
         d["additional_costs"] = json.loads(d["additional_costs"])
     if d.get("additional_costs") is None:
         d["additional_costs"] = []
+    for key in ("invoice_document", "eway_bill_document", "lr_copy_document"):
+        if isinstance(d.get(key), str):
+            d[key] = json.loads(d[key])
     d["lines"] = [dict(x) for x in lines]
     subtotal = sum(float(x["total_price"]) for x in d["lines"])
     d["subtotal"] = subtotal
     d["gst_amount"] = subtotal * (float(d["gst_rate"]) / 100.0)
     return d
+
+
+@router.post("/upload-document", dependencies=[Depends(require_module("sales_orders"))])
+async def upload_document(
+    doc_type: DocumentKind,
+    file: UploadFile = File(...),
+    user: dict = Depends(get_current_user),
+):
+    """
+    Upload a sales-invoice, e-way-bill, or LR-copy file to Cloudinary and
+    return its identity metadata (never a URL — see cloudinary_service
+    module docstring).
+
+    Deliberately not scoped to an existing sales_order_id: a document can be
+    attached while the order is still being composed in the create form,
+    before it has an id, matching the campaign-image upload pattern already
+    used elsewhere in this app (upload first, get metadata back, include it
+    in the create payload).
+
+    Two performance measures, both explained fully in cloudinary_service:
+      - Raster images (a phone photo of a paper LR copy, say) are resized and
+        re-compressed before upload, at a resolution generous enough to stay
+        legible. PDFs pass through untouched — see
+        cloudinary_service.optimize_if_image for why PDFs are not
+        recompressed at all.
+      - The actual Cloudinary call is synchronous (the SDK has no async
+        client) and is offloaded to a thread pool rather than awaited
+        directly, so one in-flight upload does not stall every other request
+        this server is handling concurrently.
+    """
+    _ = user
+    raw = await read_limited(file)
+    filename = file.filename or f"{doc_type}.pdf"
+    # CPU-bound (resize + JPEG re-encode), not I/O-bound — still worth the
+    # thread-pool hop so a large image doesn't block the event loop either.
+    raw = await run_in_threadpool(cloudinary_service.optimize_if_image, raw, filename)
+    try:
+        document = await run_in_threadpool(
+            cloudinary_service.upload_document,
+            raw,
+            filename=filename,
+            folder="sales-order-documents",
+        )
+    except RuntimeError as exc:
+        # Cloudinary not configured — a deployment/env issue, not the caller's fault.
+        raise HTTPException(503, str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(502, f"Upload to Cloudinary failed: {exc}") from exc
+    return {"doc_type": doc_type, "document": document}
+
+
+@router.get(
+    "/{so_id}/documents/{doc_type}/url",
+    dependencies=[Depends(require_module("sales_orders"))],
+)
+def get_document_url(so_id: int, doc_type: DocumentKind, db: Session = Depends(get_db)):
+    """
+    Generate a fresh signed URL for a previously-attached document.
+
+    Called on demand, right before the frontend opens the link — the URL is
+    time-limited (cloudinary_service.SIGNED_URL_TTL_SECONDS) and must never
+    be cached or persisted on either side.
+    """
+    column = _DOCUMENT_COLUMN[doc_type]
+    row = db.execute(
+        text(f"SELECT {column} AS doc FROM sales_orders WHERE id = :id"),
+        {"id": so_id},
+    ).mappings().first()
+    if row is None:
+        raise HTTPException(404, "Sales order not found")
+    document = row["doc"]
+    if isinstance(document, str):
+        document = json.loads(document)
+    if not document:
+        raise HTTPException(404, f"No {doc_type.replace('_', ' ')} attached to this order.")
+    try:
+        url = cloudinary_service.get_signed_url(document)
+    except RuntimeError as exc:
+        raise HTTPException(503, str(exc)) from exc
+    return {"url": url, "expires_in_seconds": cloudinary_service.SIGNED_URL_TTL_SECONDS}
 
 
 @router.get("")
@@ -179,11 +282,12 @@ def create_so(
             INSERT INTO sales_orders (
               invoice_number, company_name, company_location, company_contact, company_gstin,
               sales_date, delivery_date, total_amount, status, payment_status, dispatch_status,
-              gst_rate, delivery_details, notes
+              gst_rate, delivery_details, notes, invoice_document, eway_bill_document, lr_copy_document
             )
             VALUES (
               :inv, :cname, :cloc, :ccon, :gstin, :sdate, :ddate, :total, 1, 1, :dispatch,
-              :grate, CAST(:details AS jsonb), :notes
+              :grate, CAST(:details AS jsonb), :notes,
+              CAST(:invoice_doc AS jsonb), CAST(:eway_doc AS jsonb), CAST(:lr_doc AS jsonb)
             )
             RETURNING id
             """
@@ -205,6 +309,9 @@ def create_so(
             "grate": body.gst_rate,
             "details": json.dumps(body.delivery_details or {}),
             "notes": body.notes,
+            "invoice_doc": json.dumps(body.invoice_document) if body.invoice_document else None,
+            "eway_doc": json.dumps(body.eway_bill_document) if body.eway_bill_document else None,
+            "lr_doc": json.dumps(body.lr_copy_document) if body.lr_copy_document else None,
         },
     ).first()
     so_id = row[0]
@@ -381,7 +488,10 @@ def update_so(
         text(
             "UPDATE sales_orders SET company_name=:cname, company_location=:cloc, company_contact=:ccon, "
             "company_gstin=:gstin, sales_date=:sdate, delivery_date=:ddate, gst_rate=:grate, "
-            "delivery_details=CAST(:details AS jsonb), notes=:notes, total_amount=:total, updated_at=now() "
+            "delivery_details=CAST(:details AS jsonb), notes=:notes, total_amount=:total, "
+            "invoice_document=CAST(:invoice_doc AS jsonb), eway_bill_document=CAST(:eway_doc AS jsonb), "
+            "lr_copy_document=CAST(:lr_doc AS jsonb), "
+            "updated_at=now() "
             "WHERE id=:id"
         ),
         {
@@ -389,6 +499,9 @@ def update_so(
             "gstin": body.company_gstin, "sdate": body.sales_date, "ddate": body.delivery_date,
             "grate": body.gst_rate, "details": json.dumps(body.delivery_details or {}),
             "notes": body.notes, "total": new_total, "id": so_id,
+            "invoice_doc": json.dumps(body.invoice_document) if body.invoice_document else None,
+            "eway_doc": json.dumps(body.eway_bill_document) if body.eway_bill_document else None,
+            "lr_doc": json.dumps(body.lr_copy_document) if body.lr_copy_document else None,
         },
     )
     db.commit()

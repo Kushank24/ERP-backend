@@ -5,6 +5,7 @@ from datetime import date
 from typing import List, Literal, Optional
 
 from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
+from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel, Field
 from sqlalchemy import text
 from sqlalchemy.orm import Session
@@ -16,8 +17,12 @@ from ..upload_limits import read_limited
 
 router = APIRouter(prefix="/sales-orders", tags=["sales-orders"])
 
-DocumentKind = Literal["invoice", "eway_bill"]
-_DOCUMENT_COLUMN = {"invoice": "invoice_document", "eway_bill": "eway_bill_document"}
+DocumentKind = Literal["invoice", "eway_bill", "lr_copy"]
+_DOCUMENT_COLUMN = {
+    "invoice": "invoice_document",
+    "eway_bill": "eway_bill_document",
+    "lr_copy": "lr_copy_document",
+}
 
 
 class SalesLineIn(BaseModel):
@@ -47,9 +52,10 @@ class SalesOrderCreate(BaseModel):
     lines: List[SalesLineIn] = Field(min_length=1)
     # Metadata returned by POST /sales-orders/upload-document — never a URL,
     # since an authenticated Cloudinary asset has no permanent one. Both
-    # optional: the invoice/e-way bill can be attached after creation too.
+    # optional: each document can be attached after creation too.
     invoice_document: Optional[dict] = None
     eway_bill_document: Optional[dict] = None
+    lr_copy_document: Optional[dict] = None
 
 
 class SalesOrderUpdate(BaseModel):
@@ -65,6 +71,7 @@ class SalesOrderUpdate(BaseModel):
     lines: List[SalesLineUpdate] = Field(min_length=1)
     invoice_document: Optional[dict] = None
     eway_bill_document: Optional[dict] = None
+    lr_copy_document: Optional[dict] = None
 
 
 def _serialize_so(db: Session, so_id: int) -> dict:
@@ -76,7 +83,7 @@ def _serialize_so(db: Session, so_id: int) -> dict:
                    payment_status, dispatch_status,
                    delivery_details, notes, created_at, updated_at, payment_received, payment_amount,
                    COALESCE(additional_costs, '[]'::jsonb) AS additional_costs,
-                   invoice_document, eway_bill_document
+                   invoice_document, eway_bill_document, lr_copy_document
             FROM sales_orders WHERE id = :id
             """
         ),
@@ -100,7 +107,7 @@ def _serialize_so(db: Session, so_id: int) -> dict:
         d["additional_costs"] = json.loads(d["additional_costs"])
     if d.get("additional_costs") is None:
         d["additional_costs"] = []
-    for key in ("invoice_document", "eway_bill_document"):
+    for key in ("invoice_document", "eway_bill_document", "lr_copy_document"):
         if isinstance(d.get(key), str):
             d[key] = json.loads(d[key])
     d["lines"] = [dict(x) for x in lines]
@@ -117,21 +124,38 @@ async def upload_document(
     user: dict = Depends(get_current_user),
 ):
     """
-    Upload a sales-invoice or e-way-bill file to Cloudinary and return its
-    identity metadata (never a URL — see cloudinary_service module docstring).
+    Upload a sales-invoice, e-way-bill, or LR-copy file to Cloudinary and
+    return its identity metadata (never a URL — see cloudinary_service
+    module docstring).
 
-    Deliberately not scoped to an existing sales_order_id: the invoice/e-way
-    bill can be attached while the order is still being composed in the
-    create form, before it has an id, matching the campaign-image upload
-    pattern already used elsewhere in this app (upload first, get metadata
-    back, include it in the create payload).
+    Deliberately not scoped to an existing sales_order_id: a document can be
+    attached while the order is still being composed in the create form,
+    before it has an id, matching the campaign-image upload pattern already
+    used elsewhere in this app (upload first, get metadata back, include it
+    in the create payload).
+
+    Two performance measures, both explained fully in cloudinary_service:
+      - Raster images (a phone photo of a paper LR copy, say) are resized and
+        re-compressed before upload, at a resolution generous enough to stay
+        legible. PDFs pass through untouched — see
+        cloudinary_service.optimize_if_image for why PDFs are not
+        recompressed at all.
+      - The actual Cloudinary call is synchronous (the SDK has no async
+        client) and is offloaded to a thread pool rather than awaited
+        directly, so one in-flight upload does not stall every other request
+        this server is handling concurrently.
     """
     _ = user
     raw = await read_limited(file)
+    filename = file.filename or f"{doc_type}.pdf"
+    # CPU-bound (resize + JPEG re-encode), not I/O-bound — still worth the
+    # thread-pool hop so a large image doesn't block the event loop either.
+    raw = await run_in_threadpool(cloudinary_service.optimize_if_image, raw, filename)
     try:
-        document = cloudinary_service.upload_document(
+        document = await run_in_threadpool(
+            cloudinary_service.upload_document,
             raw,
-            filename=file.filename or f"{doc_type}.pdf",
+            filename=filename,
             folder="sales-order-documents",
         )
     except RuntimeError as exc:
@@ -258,12 +282,12 @@ def create_so(
             INSERT INTO sales_orders (
               invoice_number, company_name, company_location, company_contact, company_gstin,
               sales_date, delivery_date, total_amount, status, payment_status, dispatch_status,
-              gst_rate, delivery_details, notes, invoice_document, eway_bill_document
+              gst_rate, delivery_details, notes, invoice_document, eway_bill_document, lr_copy_document
             )
             VALUES (
               :inv, :cname, :cloc, :ccon, :gstin, :sdate, :ddate, :total, 1, 1, :dispatch,
               :grate, CAST(:details AS jsonb), :notes,
-              CAST(:invoice_doc AS jsonb), CAST(:eway_doc AS jsonb)
+              CAST(:invoice_doc AS jsonb), CAST(:eway_doc AS jsonb), CAST(:lr_doc AS jsonb)
             )
             RETURNING id
             """
@@ -287,6 +311,7 @@ def create_so(
             "notes": body.notes,
             "invoice_doc": json.dumps(body.invoice_document) if body.invoice_document else None,
             "eway_doc": json.dumps(body.eway_bill_document) if body.eway_bill_document else None,
+            "lr_doc": json.dumps(body.lr_copy_document) if body.lr_copy_document else None,
         },
     ).first()
     so_id = row[0]
@@ -465,6 +490,7 @@ def update_so(
             "company_gstin=:gstin, sales_date=:sdate, delivery_date=:ddate, gst_rate=:grate, "
             "delivery_details=CAST(:details AS jsonb), notes=:notes, total_amount=:total, "
             "invoice_document=CAST(:invoice_doc AS jsonb), eway_bill_document=CAST(:eway_doc AS jsonb), "
+            "lr_copy_document=CAST(:lr_doc AS jsonb), "
             "updated_at=now() "
             "WHERE id=:id"
         ),
@@ -475,6 +501,7 @@ def update_so(
             "notes": body.notes, "total": new_total, "id": so_id,
             "invoice_doc": json.dumps(body.invoice_document) if body.invoice_document else None,
             "eway_doc": json.dumps(body.eway_bill_document) if body.eway_bill_document else None,
+            "lr_doc": json.dumps(body.lr_copy_document) if body.lr_copy_document else None,
         },
     )
     db.commit()

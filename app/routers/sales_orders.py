@@ -1,19 +1,28 @@
 from __future__ import annotations
 
 import json
+import logging
+import mimetypes
+import re
+import urllib.error
+import urllib.request
 from datetime import date
+from html import escape
 from typing import List, Literal, Optional
 
 from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
 from fastapi.concurrency import run_in_threadpool
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from .. import cloudinary_service
 from ..db import get_db
 from ..deps import get_current_user, require_module
+from ..email_service import send_transactional_email
 from ..upload_limits import read_limited
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/sales-orders", tags=["sales-orders"])
 
@@ -72,6 +81,129 @@ class SalesOrderUpdate(BaseModel):
     invoice_document: Optional[dict] = None
     eway_bill_document: Optional[dict] = None
     lr_copy_document: Optional[dict] = None
+
+
+_EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+
+_DOCUMENT_LABELS = {
+    "invoice_document": "Sales Invoice",
+    "eway_bill_document": "E-Way Bill",
+    "lr_copy_document": "LR Copy",
+}
+
+
+class SendEmailBody(BaseModel):
+    to_email: str = Field(min_length=3)
+    force: bool = False
+
+    @field_validator("to_email")
+    @classmethod
+    def _validate_email(cls, v: str) -> str:
+        v = v.strip()
+        if not _EMAIL_RE.match(v):
+            raise ValueError("Enter a valid email address")
+        return v
+
+
+def _fmt_money(amount: float) -> str:
+    return f"₹{amount:,.2f}"
+
+
+def _build_so_email_html(so: dict, attached_labels: List[str]) -> tuple[str, str]:
+    """
+    Returns (subject, html) for the sales-order document email. `so` is the
+    dict shape _serialize_so() returns; `attached_labels` are the document
+    labels actually being attached (may be fewer than 3 if the sender chose
+    to proceed with some missing).
+    """
+    company = escape(so.get("company_name") or "the customer")
+    invoice_number = escape(str(so["invoice_number"]))
+
+    rows = []
+    for line in so["lines"]:
+        name = escape(str(line["product_name"]))
+        code = escape(str(line["product_code"])) if line.get("product_code") else ""
+        label = f"{name}{f' ({code})' if code else ''}"
+        qty = line["quantity_sold"]
+        unit_price = _fmt_money(float(line["unit_price"]))
+        total = _fmt_money(float(line["total_price"]))
+        rows.append(
+            f"<tr>"
+            f"<td style='padding:4px 12px 4px 0'>{label}</td>"
+            f"<td style='padding:4px 12px;text-align:right'>{qty}</td>"
+            f"<td style='padding:4px 12px;text-align:right'>{unit_price}</td>"
+            f"<td style='padding:4px 12px;text-align:right'>{total}</td>"
+            f"</tr>"
+        )
+    items_table = (
+        f"<table style='margin:12px 0;font-size:14px;width:100%;border-collapse:collapse'>"
+        f"<tr style='font-weight:600;color:#555;border-bottom:1px solid #e2e2e2'>"
+        f"<td style='padding:4px 12px 4px 0'>Item</td>"
+        f"<td style='padding:4px 12px;text-align:right'>Qty</td>"
+        f"<td style='padding:4px 12px;text-align:right'>Unit Price</td>"
+        f"<td style='padding:4px 12px;text-align:right'>Total</td>"
+        f"</tr>{''.join(rows)}</table>"
+    )
+
+    docs_html = "".join(f"<li>{escape(label)}</li>" for label in attached_labels)
+    docs_sentence = (
+        f"<p>Attached to this email {'is' if len(attached_labels) == 1 else 'are'} the "
+        f"following document{'s' if len(attached_labels) != 1 else ''} for this order:</p>"
+        f"<ul>{docs_html}</ul>"
+        if attached_labels
+        else "<p>No supporting documents were available to attach to this email.</p>"
+    )
+
+    subject = f"Sales Order {invoice_number} — Documents from E-SAFE Enterprises"
+    total_amount = _fmt_money(float(so["total_amount"]))
+
+    html = f"""
+    <div style="font-family:Arial,sans-serif;font-size:14px;line-height:1.6;color:#222">
+      <p>Dear {company},</p>
+      <p>
+        Please find below the details of Sales Order <strong>{invoice_number}</strong>,
+        along with the associated documents.
+      </p>
+      {items_table}
+      <p style="margin:0 0 12px"><strong>Order Total: {total_amount}</strong></p>
+      {docs_sentence}
+      <p>Please feel free to reach out with any questions regarding this order.</p>
+      <p>
+        Best regards,<br>
+        <strong>E-SAFE Enterprises</strong><br>
+        <span style="color:#666;font-size:13px">
+          G-176, Boranada Industrial Park, Jodhpur-342012 (RAJ.)<br>
+          Phone: +91 291 2944321 · Mobile: +91 94133 24321<br>
+          Email: esafe@esafe.co.in · www.esafe.co.in
+        </span>
+      </p>
+    </div>
+    """.strip()
+
+    return subject, html
+
+
+def _fetch_document_bytes(document: dict) -> Optional[tuple[str, bytes, str]]:
+    """
+    Downloads a sales-order document's bytes via a freshly generated
+    Cloudinary signed URL, for attaching to an outbound email.
+
+    Returns (filename, bytes, mime_type), or None if the download fails —
+    a single unreachable document should not block the whole email from
+    going out with the others attached.
+    """
+    try:
+        url = cloudinary_service.get_signed_url(document)
+        with urllib.request.urlopen(url, timeout=30) as resp:
+            raw = resp.read()
+    except (RuntimeError, urllib.error.URLError, TimeoutError) as exc:
+        logger.warning("Could not download document %r for emailing: %s", document.get("public_id"), exc)
+        return None
+
+    fmt = (document.get("format") or "").lower()
+    filename = document.get("original_filename") or f"document.{fmt or 'pdf'}"
+    mime_type = mimetypes.guess_type(filename)[0] or "application/octet-stream"
+    return filename, raw, mime_type
 
 
 def _serialize_so(db: Session, so_id: int) -> dict:
@@ -195,6 +327,57 @@ def get_document_url(so_id: int, doc_type: DocumentKind, db: Session = Depends(g
     except RuntimeError as exc:
         raise HTTPException(503, str(exc)) from exc
     return {"url": url, "expires_in_seconds": cloudinary_service.SIGNED_URL_TTL_SECONDS}
+
+
+@router.post(
+    "/{so_id}/send-email",
+    dependencies=[Depends(require_module("sales_orders"))],
+)
+def send_email(
+    so_id: int,
+    body: SendEmailBody,
+    db: Session = Depends(get_db),
+    user: dict = Depends(get_current_user),
+):
+    """
+    Emails the sales order's item list plus whichever of the three
+    documents (invoice, e-way bill, LR copy) are attached, to `to_email`.
+
+    Two-step confirmation, driven by `force`:
+      - force=False (the initial call): if any of the three documents is
+        missing, nothing is sent — the response reports which are missing
+        so the caller can ask "send anyway?" before retrying.
+      - force=True: sends regardless of what's missing, attaching only the
+        documents that are actually present.
+    """
+    _ = user
+    so = _serialize_so(db, so_id)
+
+    missing = [label for key, label in _DOCUMENT_LABELS.items() if not so.get(key)]
+    if missing and not body.force:
+        return {"status": "missing_documents", "missing": missing}
+
+    attachments = []
+    attached_labels = []
+    for key, label in _DOCUMENT_LABELS.items():
+        document = so.get(key)
+        if not document:
+            continue
+        fetched = _fetch_document_bytes(document)
+        if fetched is None:
+            continue
+        attachments.append(fetched)
+        attached_labels.append(label)
+
+    subject, html = _build_so_email_html(so, attached_labels)
+    try:
+        send_transactional_email(
+            body.to_email, subject, html, attachments=attachments, bcc="accounts@esafe.co.in",
+        )
+    except Exception as exc:
+        raise HTTPException(502, f"Failed to send email: {exc}") from exc
+
+    return {"status": "sent", "attached": attached_labels}
 
 
 @router.get("")

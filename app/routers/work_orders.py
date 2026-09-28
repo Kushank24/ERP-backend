@@ -162,6 +162,46 @@ def list_wos(
     return {"data": [dict(r) for r in rows], "total": total}
 
 
+@router.get("/parties/list")
+def list_parties(db: Session = Depends(get_db), user: dict = Depends(get_current_user)):
+    _ = user
+    rows = db.execute(
+        text("SELECT DISTINCT ON (party_name) party_name FROM work_orders WHERE party_name IS NOT NULL AND party_name != '' ORDER BY party_name, created_at DESC")
+    ).mappings().all()
+    return [dict(r) for r in rows]
+
+
+@router.get("/check-fg-overlap")
+def check_fg_overlap(
+    product_ids: str = Query(..., description="Comma-separated product IDs"),
+    db: Session = Depends(get_db),
+    user: dict = Depends(get_current_user),
+):
+    """Return which of the given product IDs already have stock in finished_goods."""
+    _ = user
+    try:
+        ids = [int(x.strip()) for x in product_ids.split(",") if x.strip()]
+    except ValueError:
+        raise HTTPException(400, "product_ids must be comma-separated integers")
+    if not ids:
+        return []
+    rows = db.execute(
+        text(
+            """
+            SELECT fg.product_name, p.id AS product_id,
+                   SUM(fg.quantity_in_stock) AS total_stock
+            FROM finished_goods fg
+            JOIN products p ON p.name = fg.product_name
+            WHERE p.id = ANY(:ids) AND fg.quantity_in_stock > 0
+            GROUP BY fg.product_name, p.id
+            HAVING SUM(fg.quantity_in_stock) > 0
+            """
+        ),
+        {"ids": ids},
+    ).mappings().all()
+    return [dict(r) for r in rows]
+
+
 @router.get("/{wo_id}")
 def get_wo(wo_id: int, db: Session = Depends(get_db), user: dict = Depends(get_current_user)):
     _ = user
@@ -173,13 +213,22 @@ def get_wo_materials(wo_id: int, db: Session = Depends(get_db), user: dict = Dep
     wo = _load_wo(db, wo_id)
     return _compute_materials(db, wo["products"])
 
-@router.get("/parties/list")
-def list_parties(db: Session = Depends(get_db), user: dict = Depends(get_current_user)):
+@router.delete("/{wo_id}", status_code=204, dependencies=[Depends(require_module("work_orders"))])
+def delete_wo(
+    wo_id: int,
+    db: Session = Depends(get_db),
+    user: dict = Depends(get_current_user),
+):
     _ = user
-    rows = db.execute(
-        text("SELECT DISTINCT ON (party_name) party_name FROM work_orders WHERE party_name IS NOT NULL AND party_name != '' ORDER BY party_name, created_at DESC")
-    ).mappings().all()
-    return [dict(r) for r in rows]
+    wo = db.execute(
+        text("SELECT id FROM work_orders WHERE id = :id"), {"id": wo_id}
+    ).first()
+    if not wo:
+        raise HTTPException(404, "Work order not found")
+    # work_order_product_issues cascades; work_order_products does not
+    db.execute(text("DELETE FROM work_order_products WHERE work_order_id = :id"), {"id": wo_id})
+    db.execute(text("DELETE FROM work_orders WHERE id = :id"), {"id": wo_id})
+    db.commit()
 
 
 @router.post("", status_code=201, dependencies=[Depends(require_module("work_orders"))])

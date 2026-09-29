@@ -95,6 +95,8 @@ _DOCUMENT_LABELS = {
 class SendEmailBody(BaseModel):
     to_email: str = Field(min_length=3)
     force: bool = False
+    cc_emails: Optional[str] = None
+    bcc_emails: Optional[str] = None
 
     @field_validator("to_email")
     @classmethod
@@ -102,6 +104,17 @@ class SendEmailBody(BaseModel):
         v = v.strip()
         if not _EMAIL_RE.match(v):
             raise ValueError("Enter a valid email address")
+        return v
+
+    @field_validator("cc_emails", "bcc_emails")
+    @classmethod
+    def _validate_multi_email(cls, v: Optional[str]) -> Optional[str]:
+        if not v:
+            return v
+        for addr in v.split(","):
+            addr = addr.strip()
+            if addr and not _EMAIL_RE.match(addr):
+                raise ValueError(f"Invalid email address: {addr}")
         return v
 
 
@@ -370,9 +383,20 @@ def send_email(
         attached_labels.append(label)
 
     subject, html = _build_so_email_html(so, attached_labels)
+
+    # Merge the user-supplied bcc with the fixed internal bcc address.
+    internal_bcc = "accounts@esafe.co.in"
+    if body.bcc_emails and body.bcc_emails.strip():
+        merged_bcc = f"{internal_bcc},{body.bcc_emails}"
+    else:
+        merged_bcc = internal_bcc
+
     try:
         send_transactional_email(
-            body.to_email, subject, html, attachments=attachments, bcc="accounts@esafe.co.in",
+            body.to_email, subject, html,
+            attachments=attachments,
+            cc=body.cc_emails or None,
+            bcc=merged_bcc,
         )
     except Exception as exc:
         raise HTTPException(502, f"Failed to send email: {exc}") from exc

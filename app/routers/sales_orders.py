@@ -401,6 +401,12 @@ def send_email(
     except Exception as exc:
         raise HTTPException(502, f"Failed to send email: {exc}") from exc
 
+    db.execute(
+        text("UPDATE sales_orders SET email_last_sent_at = NOW() WHERE id = :id"),
+        {"id": so_id},
+    )
+    db.commit()
+
     return {"status": "sent", "attached": attached_labels}
 
 
@@ -425,7 +431,8 @@ def list_so(
         text(f"""
             SELECT id, invoice_number, company_name, total_amount, status,
                    payment_status, dispatch_status,
-                   sales_date, created_at, payment_received, payment_amount
+                   sales_date, created_at, payment_received, payment_amount,
+                   email_last_sent_at
             FROM sales_orders {where}
             ORDER BY created_at DESC NULLS LAST
         """),

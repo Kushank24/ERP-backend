@@ -10,7 +10,7 @@ from datetime import date
 from html import escape
 from typing import List, Literal, Optional
 
-from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
+from fastapi import APIRouter, BackgroundTasks, Depends, File, HTTPException, Query, UploadFile
 from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import text
@@ -355,36 +355,22 @@ def get_document_url(so_id: int, doc_type: DocumentKind, db: Session = Depends(g
     return {"url": url, "expires_in_seconds": cloudinary_service.SIGNED_URL_TTL_SECONDS}
 
 
-@router.post(
-    "/{so_id}/send-email",
-    dependencies=[Depends(require_module("sales_orders"))],
-)
-def send_email(
+def _do_send_email(
     so_id: int,
-    body: SendEmailBody,
-    db: Session = Depends(get_db),
-    user: dict = Depends(get_current_user),
-):
+    to_email: str,
+    cc_emails: Optional[str],
+    bcc_emails: Optional[str],
+    so: dict,
+    attached_labels: List[str],
+) -> None:
     """
-    Emails the sales order's item list plus whichever of the three
-    documents (invoice, e-way bill, LR copy) are attached, to `to_email`.
-
-    Two-step confirmation, driven by `force`:
-      - force=False (the initial call): if any of the three documents is
-        missing, nothing is sent — the response reports which are missing
-        so the caller can ask "send anyway?" before retrying.
-      - force=True: sends regardless of what's missing, attaching only the
-        documents that are actually present.
+    Background task: fetch document bytes, send the email, stamp the DB row.
+    Runs after the HTTP response has already been returned to the caller.
     """
-    _ = user
-    so = _serialize_so(db, so_id)
-
-    missing = [label for key, label in _DOCUMENT_LABELS.items() if not so.get(key)]
-    if missing and not body.force:
-        return {"status": "missing_documents", "missing": missing}
+    from ..email_service import send_transactional_email
+    from ..db import SessionLocal
 
     attachments = []
-    attached_labels = []
     for key, label in _DOCUMENT_LABELS.items():
         document = so.get(key)
         if not document:
@@ -393,32 +379,79 @@ def send_email(
         if fetched is None:
             continue
         attachments.append(fetched)
-        attached_labels.append(label)
 
     subject, html = _build_so_email_html(so, attached_labels)
 
-    # Merge the user-supplied bcc with the fixed internal bcc address.
     internal_bcc = "accounts@esafe.co.in"
-    if body.bcc_emails and body.bcc_emails.strip():
-        merged_bcc = f"{internal_bcc},{body.bcc_emails}"
-    else:
-        merged_bcc = internal_bcc
+    merged_bcc = f"{internal_bcc},{bcc_emails}" if bcc_emails and bcc_emails.strip() else internal_bcc
 
     try:
         send_transactional_email(
-            body.to_email, subject, html,
+            to_email, subject, html,
             attachments=attachments,
-            cc=body.cc_emails or None,
+            cc=cc_emails or None,
             bcc=merged_bcc,
         )
     except Exception as exc:
-        raise HTTPException(502, f"Failed to send email: {exc}") from exc
+        logger.error("Background send-email failed for SO %s: %s", so_id, exc)
+        return
 
-    db.execute(
-        text("UPDATE sales_orders SET email_last_sent_at = NOW() WHERE id = :id"),
-        {"id": so_id},
+    try:
+        with SessionLocal() as db:
+            db.execute(
+                text("UPDATE sales_orders SET email_last_sent_at = NOW() WHERE id = :id"),
+                {"id": so_id},
+            )
+            db.commit()
+    except Exception as exc:
+        logger.error("Failed to stamp email_last_sent_at for SO %s: %s", so_id, exc)
+
+
+@router.post(
+    "/{so_id}/send-email",
+    dependencies=[Depends(require_module("sales_orders"))],
+)
+def send_email(
+    so_id: int,
+    body: SendEmailBody,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+    user: dict = Depends(get_current_user),
+):
+    """
+    Validates the request and returns immediately; the actual Cloudinary
+    download and Resend API call happen in a background task so the UI is
+    never blocked waiting for external services.
+
+    Two-step confirmation, driven by `force`:
+      - force=False (the initial call): if any of the three documents is
+        missing, nothing is queued — the response reports which are missing
+        so the caller can ask "send anyway?" before retrying.
+      - force=True: queues the send regardless of what's missing, attaching
+        only the documents that are actually present.
+    """
+    _ = user
+    so = _serialize_so(db, so_id)
+
+    missing = [label for key, label in _DOCUMENT_LABELS.items() if not so.get(key)]
+    if missing and not body.force:
+        return {"status": "missing_documents", "missing": missing}
+
+    # Determine which documents will be attached (labels only — bytes are
+    # fetched inside the background task to keep this handler fast).
+    attached_labels = [
+        label for key, label in _DOCUMENT_LABELS.items() if so.get(key)
+    ]
+
+    background_tasks.add_task(
+        _do_send_email,
+        so_id,
+        body.to_email.strip(),
+        body.cc_emails,
+        body.bcc_emails,
+        so,
+        attached_labels,
     )
-    db.commit()
 
     return {"status": "sent", "attached": attached_labels}
 

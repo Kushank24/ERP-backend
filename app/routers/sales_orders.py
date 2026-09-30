@@ -132,20 +132,28 @@ def _build_so_email_html(so: dict, attached_labels: List[str]) -> tuple[str, str
     company = escape(so.get("company_name") or "the customer")
     invoice_number = escape(str(so["invoice_number"]))
 
-    rows = []
+    # Consolidate lines with the same product name and unit price into one row.
+    consolidated: dict[tuple, dict] = {}
     for line in so["lines"]:
         name = escape(str(line["product_name"]))
-        code = escape(str(line["product_code"])) if line.get("product_code") else ""
-        label = f"{name}{f' ({code})' if code else ''}"
-        qty = line["quantity_sold"]
-        unit_price = _fmt_money(float(line["unit_price"]))
-        total = _fmt_money(float(line["total_price"]))
+        up = float(line["unit_price"])
+        key = (name, up)
+        if key in consolidated:
+            consolidated[key]["qty"] += float(line["quantity_sold"])
+        else:
+            consolidated[key] = {"name": name, "unit_price": up, "qty": float(line["quantity_sold"])}
+
+    rows = []
+    for entry in consolidated.values():
+        total_qty = entry["qty"]
+        up = entry["unit_price"]
+        qty_display = int(total_qty) if total_qty == int(total_qty) else total_qty
         rows.append(
             f"<tr>"
-            f"<td style='padding:4px 12px 4px 0'>{label}</td>"
-            f"<td style='padding:4px 12px;text-align:right'>{qty}</td>"
-            f"<td style='padding:4px 12px;text-align:right'>{unit_price}</td>"
-            f"<td style='padding:4px 12px;text-align:right'>{total}</td>"
+            f"<td style='padding:4px 12px 4px 0'>{entry['name']}</td>"
+            f"<td style='padding:4px 12px;text-align:right'>{qty_display}</td>"
+            f"<td style='padding:4px 12px;text-align:right'>{_fmt_money(up)}</td>"
+            f"<td style='padding:4px 12px;text-align:right'>{_fmt_money(up * total_qty)}</td>"
             f"</tr>"
         )
     items_table = (

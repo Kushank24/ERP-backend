@@ -158,6 +158,76 @@ def patch_material(
     return dict(r)
 
 
+@router.get("/{material_id}/history")
+def get_material_history(
+    material_id: int,
+    db: Session = Depends(get_db),
+    user: dict = Depends(get_current_user),
+):
+    _ = user
+    mat = db.execute(
+        text("SELECT id, name, unit FROM materials WHERE id = :id"),
+        {"id": material_id},
+    ).mappings().first()
+    if not mat:
+        raise HTTPException(404, "Material not found")
+
+    purchases = db.execute(
+        text("""
+            SELECT
+                po.id            AS po_id,
+                po.purchase_number,
+                po.purchase_date,
+                s.name           AS supplier_name,
+                s.location       AS supplier_location,
+                s.contact        AS supplier_contact,
+                pol.length_weight_nos AS quantity_ordered,
+                pol.delivered_qty     AS quantity_delivered,
+                pol.per_unit_cost,
+                pol.unit,
+                pol.comment
+            FROM purchase_order_lines pol
+            JOIN purchase_orders po ON po.id = pol.purchase_order_id
+            LEFT JOIN suppliers s   ON s.id  = po.supplier_id
+            WHERE LOWER(TRIM(pol.material_name)) = LOWER(TRIM(:name))
+            ORDER BY po.purchase_date DESC NULLS LAST, po.id DESC
+        """),
+        {"name": mat["name"]},
+    ).mappings().all()
+
+    usages = db.execute(
+        text("""
+            SELECT
+                wo.id                 AS wo_id,
+                wo.work_order_number,
+                wo.party_name,
+                wo.updated_at         AS completed_at,
+                wo.delivery_date,
+                SUM(b.total_quantity_consumed * wop.quantity) AS quantity_consumed,
+                b.units               AS boq_unit
+            FROM work_orders wo
+            JOIN work_order_products wop
+                ON wop.work_order_id = wo.id
+            JOIN product_bill_of_quantity_relations pbr
+                ON pbr.product_id = wop.product_id
+            JOIN bill_of_quantities b
+                ON b.id = pbr.bill_of_quantity_id
+            WHERE wo.status = 'completed'
+              AND LOWER(TRIM(b.name)) = LOWER(TRIM(:name))
+            GROUP BY wo.id, wo.work_order_number, wo.party_name,
+                     wo.updated_at, wo.delivery_date, b.units
+            ORDER BY wo.updated_at DESC NULLS LAST
+        """),
+        {"name": mat["name"]},
+    ).mappings().all()
+
+    return {
+        "material": dict(mat),
+        "purchases": [dict(r) for r in purchases],
+        "usages": [dict(r) for r in usages],
+    }
+
+
 @router.post("/{material_id}/convert", status_code=201, dependencies=[Depends(require_module("inventory"))])
 def convert_to_finished_good(
     material_id: int,

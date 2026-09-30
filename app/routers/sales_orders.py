@@ -133,15 +133,20 @@ def _build_so_email_html(so: dict, attached_labels: List[str]) -> tuple[str, str
     invoice_number = escape(str(so["invoice_number"]))
 
     # Consolidate lines with the same product name and unit price into one row.
+    # Only append the product code when it is non-empty and differs from the
+    # product name — prevents "Name (Name)" when the two fields are identical.
     consolidated: dict[tuple, dict] = {}
     for line in so["lines"]:
         name = escape(str(line["product_name"]))
+        raw_code = str(line.get("product_code") or "").strip()
+        code = escape(raw_code) if raw_code and raw_code != str(line["product_name"]).strip() else ""
+        label = f"{name} ({code})" if code else name
         up = float(line["unit_price"])
-        key = (name, up)
+        key = (label, up)
         if key in consolidated:
             consolidated[key]["qty"] += float(line["quantity_sold"])
         else:
-            consolidated[key] = {"name": name, "unit_price": up, "qty": float(line["quantity_sold"])}
+            consolidated[key] = {"name": label, "unit_price": up, "qty": float(line["quantity_sold"])}
 
     rows = []
     for entry in consolidated.values():

@@ -57,7 +57,8 @@ CREATE TABLE IF NOT EXISTS email_campaign_failures (
 """
 
 
-def _ensure_tables(db: Session):
+def ensure_tables_once(db: Session) -> None:
+    """Called once at startup, not on every request."""
     db.execute(text(_SETUP_SQL))
     db.commit()
 
@@ -228,7 +229,6 @@ def delete_campaign(
 ):
     """Delete a campaign record (and its failure log via CASCADE)."""
     _ = user
-    _ensure_tables(db)
     row = db.execute(
         text("SELECT status FROM email_campaigns WHERE id = :id"),
         {"id": campaign_id},
@@ -244,7 +244,6 @@ def delete_campaign(
 @router.get("")
 def list_campaigns(db: Session = Depends(get_db), user: dict = Depends(get_current_user)):
     _ = user
-    _ensure_tables(db)
     rows = db.execute(
         text(
             "SELECT id, subject, reply_to, cc, bcc, status, total_recipients, "
@@ -290,7 +289,6 @@ async def parse_contacts(
 @router.get("/active")
 def get_active(db: Session = Depends(get_db), user: dict = Depends(get_current_user)):
     _ = user
-    _ensure_tables(db)
     row = db.execute(
         text(
             "SELECT id, subject, status, total_recipients, sent_count, failed_count, created_at "
@@ -307,8 +305,6 @@ def create_campaign(
     user: dict = Depends(get_current_user),
 ):
     _ = user
-    _ensure_tables(db)
-
     if email_service.is_running():
         raise HTTPException(409, "A campaign is already running. Stop it first.")
 

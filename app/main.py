@@ -10,6 +10,7 @@ from sqlalchemy.exc import OperationalError, SQLAlchemyError
 from .config import settings
 from .deps import require_any_module
 from .logging_config import configure_logging
+from .db import SessionLocal
 from .routers import (
     analytics,
     auth,
@@ -34,6 +35,15 @@ configure_logging()
 logger = logging.getLogger(__name__)
 
 app = FastAPI(title="E-Safe ERP API", version="1.0.0")
+
+
+@app.on_event("startup")
+def _bootstrap_email_campaigns() -> None:
+    db = SessionLocal()
+    try:
+        email_campaigns.ensure_tables_once(db)
+    finally:
+        db.close()
 
 # ---------------------------------------------------------------------------
 # CORS

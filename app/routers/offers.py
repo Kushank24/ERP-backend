@@ -115,11 +115,16 @@ def _serialize(db: Session, offer_id: int) -> dict:
     if item_ids:
         all_specs = db.execute(
             text("""
-                SELECT ois.offer_item_id, ois.specification_id, ois.value, s.name AS spec_name
+                SELECT ois.offer_item_id, ois.specification_id, ois.value, s.name AS spec_name,
+                       COALESCE(cps.display_order, 9999) AS display_order
                 FROM offer_item_specifications ois
                 JOIN specifications s ON s.id = ois.specification_id
+                JOIN offer_items oi ON oi.id = ois.offer_item_id
+                LEFT JOIN catalog_product_specifications cps
+                       ON cps.catalog_product_id = oi.product_id
+                      AND cps.specification_id = ois.specification_id
                 WHERE ois.offer_item_id = ANY(:ids)
-                ORDER BY ois.offer_item_id, ois.specification_id
+                ORDER BY ois.offer_item_id, COALESCE(cps.display_order, 9999), s.name
             """),
             {"ids": item_ids},
         ).mappings().all()

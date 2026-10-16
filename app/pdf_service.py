@@ -679,7 +679,7 @@ class PDFGenerationService:
             # Specifications — model number always last
             specs = [s for s in (item.get("specifications") or []) if str(s.get("value") or "").strip()]
             if specs:
-                specs = sorted(specs, key=lambda s: (s.get("display_order") or 9999, s.get("spec_name") or ""))
+                specs = sorted(specs, key=lambda s: (9999 if s.get("display_order") is None else s["display_order"], s.get("spec_name") or ""))
                 desc_html += "<br/>Specifications:"
                 for s in specs:
                     desc_html += (

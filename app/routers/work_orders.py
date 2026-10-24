@@ -9,6 +9,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
+from ..cache import cache_bust, cache_get, cache_set
 from ..db import get_db
 from ..deps import get_current_user, require_module
 from ..pdf_service import PDFGenerationService
@@ -129,6 +130,10 @@ def list_wos(
     user: dict = Depends(get_current_user),
 ):
     _ = user
+    key = f"wo:list:{q}:{status}:{date_from}:{date_to}:{limit}:{offset}"
+    cached = cache_get(key)
+    if cached is not None:
+        return cached
     conditions = []
     params: dict = {}
     if q and q.strip():
@@ -159,16 +164,24 @@ def list_wos(
         """),
         params,
     ).mappings().all()
-    return {"data": [dict(r) for r in rows], "total": total}
+    result = {"data": [dict(r) for r in rows], "total": total}
+    cache_set(key, result, ttl=180)
+    return result
 
 
 @router.get("/parties/list")
 def list_parties(db: Session = Depends(get_db), user: dict = Depends(get_current_user)):
     _ = user
+    key = "wo:parties"
+    cached = cache_get(key)
+    if cached is not None:
+        return cached
     rows = db.execute(
         text("SELECT DISTINCT ON (party_name) party_name FROM work_orders WHERE party_name IS NOT NULL AND party_name != '' ORDER BY party_name, created_at DESC")
     ).mappings().all()
-    return [dict(r) for r in rows]
+    result = [dict(r) for r in rows]
+    cache_set(key, result, ttl=600)
+    return result
 
 
 @router.get("/check-fg-overlap")
@@ -205,13 +218,25 @@ def check_fg_overlap(
 @router.get("/{wo_id}")
 def get_wo(wo_id: int, db: Session = Depends(get_db), user: dict = Depends(get_current_user)):
     _ = user
-    return _load_wo(db, wo_id)
+    key = f"wo:item:{wo_id}"
+    cached = cache_get(key)
+    if cached is not None:
+        return cached
+    result = _load_wo(db, wo_id)
+    cache_set(key, result, ttl=180)
+    return result
 
 @router.get("/{wo_id}/materials")
 def get_wo_materials(wo_id: int, db: Session = Depends(get_db), user: dict = Depends(get_current_user)):
     _ = user
+    key = f"wo:materials:{wo_id}"
+    cached = cache_get(key)
+    if cached is not None:
+        return cached
     wo = _load_wo(db, wo_id)
-    return _compute_materials(db, wo["products"])
+    result = _compute_materials(db, wo["products"])
+    cache_set(key, result, ttl=180)
+    return result
 
 @router.delete("/{wo_id}", status_code=204, dependencies=[Depends(require_module("work_orders"))])
 def delete_wo(
@@ -229,6 +254,7 @@ def delete_wo(
     db.execute(text("DELETE FROM work_order_products WHERE work_order_id = :id"), {"id": wo_id})
     db.execute(text("DELETE FROM work_orders WHERE id = :id"), {"id": wo_id})
     db.commit()
+    cache_bust("wo")
 
 
 @router.post("", status_code=201, dependencies=[Depends(require_module("work_orders"))])
@@ -290,6 +316,7 @@ def create_wo(
         )
 
     db.commit()
+    cache_bust("wo")
     return _load_wo(db, wid)
 
 
@@ -357,6 +384,7 @@ def update_wo(
             )
 
     db.commit()
+    cache_bust("wo")
     return _load_wo(db, wo_id)
 
 
@@ -551,6 +579,7 @@ def patch_status(
         {"s": body.status, "id": wo_id},
     )
     db.commit()
+    cache_bust("wo", "materials", "fg")
     return _load_wo(db, wo_id)
 
 
@@ -656,6 +685,7 @@ def issue_products(
             )
 
     db.commit()
+    cache_bust("wo", "fg")
     return _load_wo(db, wo_id)
 
 

@@ -8,6 +8,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
+from ..cache import cache_bust, cache_get, cache_set
 from ..db import get_db
 from ..deps import get_current_user, require_module
 
@@ -100,6 +101,10 @@ def list_enquiries(
     db: Session = Depends(get_db),
     _user: dict = Depends(get_current_user),
 ):
+    key = f"enquiries:list:{status}:{company_id}:{q}:{date_from}:{date_to}:{limit}:{offset}"
+    cached = cache_get(key)
+    if cached is not None:
+        return cached
     where = []
     params: dict = {}
     if status:
@@ -135,7 +140,9 @@ def list_enquiries(
         """),
         params,
     ).mappings().all()
-    return {"data": [dict(r) for r in rows], "total": total}
+    result = {"data": [dict(r) for r in rows], "total": total}
+    cache_set(key, result, ttl=180)
+    return result
 
 
 @router.post("", status_code=201, dependencies=[Depends(require_module("enquiries"))])
@@ -190,6 +197,7 @@ def create_enquiry(
         )
 
     db.commit()
+    cache_bust("enquiries")
     return _serialize(db, enq_id)
 
 
@@ -199,7 +207,13 @@ def get_enquiry(
     db: Session = Depends(get_db),
     _user: dict = Depends(get_current_user),
 ):
-    return _serialize(db, enquiry_id)
+    key = f"enquiries:item:{enquiry_id}"
+    cached = cache_get(key)
+    if cached is not None:
+        return cached
+    result = _serialize(db, enquiry_id)
+    cache_set(key, result, ttl=180)
+    return result
 
 
 @router.put("/{enquiry_id}", dependencies=[Depends(require_module("enquiries"))])
@@ -255,6 +269,7 @@ def update_enquiry(
         )
 
     db.commit()
+    cache_bust("enquiries")
     return _serialize(db, enquiry_id)
 
 
@@ -267,3 +282,4 @@ def delete_enquiry(
     _serialize(db, enquiry_id)  # 404 guard
     db.execute(text("DELETE FROM enquiries WHERE id = :id"), {"id": enquiry_id})
     db.commit()
+    cache_bust("enquiries")

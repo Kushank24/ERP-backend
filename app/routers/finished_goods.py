@@ -8,6 +8,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
+from ..cache import cache_bust, cache_get, cache_set
 from ..db import get_db
 from ..deps import get_current_user, require_module
 
@@ -42,6 +43,10 @@ def list_fg(
     user: dict = Depends(get_current_user),
 ):
     _ = user
+    key = f"fg:list:{q}"
+    cached = cache_get(key)
+    if cached is not None:
+        return cached
     where = "WHERE quantity_in_stock > 0"
     params: dict = {}
     if q and q.strip():
@@ -60,7 +65,9 @@ def list_fg(
         """),
         params,
     ).mappings().all()
-    return [dict(r) for r in rows]
+    result = [dict(r) for r in rows]
+    cache_set(key, result, ttl=180)
+    return result
 
 
 @router.post("", status_code=201, dependencies=[Depends(require_module("finished_goods"))])
@@ -102,6 +109,7 @@ def create_fg(
         },
     ).first()
     db.commit()
+    cache_bust("fg")
     fid = row[0]
     r = db.execute(
         text(
@@ -176,6 +184,7 @@ def return_to_inventory(
         mat_id = mat_row[0]
 
     db.commit()
+    cache_bust("fg", "materials")
 
     mat_updated = db.execute(
         text("SELECT id, name, unit, length_weight_nos, per_unit_cost FROM materials WHERE id = :id"),

@@ -7,6 +7,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
+from ..cache import cache_bust, cache_get, cache_set
 from ..db import get_db
 from ..deps import get_current_user, require_module
 
@@ -46,6 +47,10 @@ def list_materials(
     user: dict = Depends(get_current_user),
 ):
     _ = user
+    key = f"materials:list:{q}:{limit}:{offset}"
+    cached = cache_get(key)
+    if cached is not None:
+        return cached
 
     # Aggregates over ALL materials (independent of search filter)
     stats = db.execute(text("""
@@ -78,13 +83,15 @@ def list_materials(
         params,
     ).mappings().all()
 
-    return {
+    result = {
         "items": [dict(r) for r in rows],
         "total": total,
         "total_count": stats["total_count"],
         "total_value": float(stats["total_value"]),
         "low_stock_count": stats["low_stock_count"],
     }
+    cache_set(key, result, ttl=300)
+    return result
 
 
 @router.post("", status_code=201, dependencies=[Depends(require_module("inventory"))])
@@ -114,6 +121,7 @@ def create_material(
         },
     ).mappings().first()
     db.commit()
+    cache_bust("materials")
     return dict(res)
 
 
@@ -149,6 +157,7 @@ def patch_material(
         params,
     )
     db.commit()
+    cache_bust("materials")
     r = db.execute(
         text(
             "SELECT id, name, length_weight_nos, unit, per_unit_cost, created_at, updated_at FROM materials WHERE id = :id"
@@ -165,6 +174,10 @@ def get_material_history(
     user: dict = Depends(get_current_user),
 ):
     _ = user
+    key = f"materials:history:{material_id}"
+    cached = cache_get(key)
+    if cached is not None:
+        return cached
     mat = db.execute(
         text("SELECT id, name, unit FROM materials WHERE id = :id"),
         {"id": material_id},
@@ -221,11 +234,13 @@ def get_material_history(
         {"name": mat["name"]},
     ).mappings().all()
 
-    return {
+    result = {
         "material": dict(mat),
         "purchases": [dict(r) for r in purchases],
         "usages": [dict(r) for r in usages],
     }
+    cache_set(key, result, ttl=600)
+    return result
 
 
 @router.post("/{material_id}/convert", status_code=201, dependencies=[Depends(require_module("inventory"))])
@@ -277,6 +292,7 @@ def convert_to_finished_good(
     ).mappings().first()
 
     db.commit()
+    cache_bust("materials", "fg")
 
     mat_updated = db.execute(
         text("SELECT id, name, length_weight_nos, unit, per_unit_cost, created_at, updated_at FROM materials WHERE id = :id"),

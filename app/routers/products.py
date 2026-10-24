@@ -14,6 +14,7 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from ..boq_math import total_quantity_consumed
+from ..cache import cache_bust, cache_get, cache_set
 from ..db import get_db
 from ..deps import get_current_user, require_module
 from ..upload_limits import read_limited
@@ -105,10 +106,16 @@ def _product_dict(db: Session, product_id: int) -> dict:
 @router.get("/categories")
 def list_categories(db: Session = Depends(get_db), user: dict = Depends(get_current_user)):
     _ = user
+    key = "products:categories"
+    cached = cache_get(key)
+    if cached is not None:
+        return cached
     rows = db.execute(
         text("SELECT DISTINCT category FROM products ORDER BY category NULLS LAST")
     ).scalars().all()
-    return [r or "" for r in rows]
+    result = [r or "" for r in rows]
+    cache_set(key, result, ttl=600)
+    return result
 
 
 @router.get("")
@@ -122,6 +129,10 @@ def list_products(
     user: dict = Depends(get_current_user),
 ):
     _ = user
+    key = f"products:list:{search}:{category}:{has_specs}:{page}:{page_size}"
+    cached = cache_get(key)
+    if cached is not None:
+        return cached
     conditions: list[str] = []
     params: dict = {}
 
@@ -168,12 +179,14 @@ def list_products(
         params,
     ).mappings().all()
 
-    return {
+    result = {
         "items": [dict(r) for r in rows],
         "total": total,
         "page": page,
         "page_size": page_size,
     }
+    cache_set(key, result, ttl=600)
+    return result
 
 
 @router.get("/specifications/catalog")
@@ -181,6 +194,10 @@ def list_all_specifications(
     db: Session = Depends(get_db),
     _user: dict = Depends(get_current_user),
 ):
+    key = "products:spec_catalog"
+    cached = cache_get(key)
+    if cached is not None:
+        return cached
     rows = db.execute(
         text("""
             SELECT s.id, s.name, COUNT(ps.product_id)::int AS product_count
@@ -190,7 +207,9 @@ def list_all_specifications(
             ORDER BY s.name
         """)
     ).mappings().all()
-    return [dict(r) for r in rows]
+    result = [dict(r) for r in rows]
+    cache_set(key, result, ttl=600)
+    return result
 
 
 @router.post("/specifications/catalog", status_code=201, dependencies=[Depends(require_module("products_boq"))])
@@ -211,6 +230,7 @@ def create_specification(
     if not row:
         raise HTTPException(400, f'Specification "{name}" already exists')
     db.commit()
+    cache_bust("products")
     return {**dict(row), "product_count": 0}
 
 
@@ -220,6 +240,10 @@ def get_product_specifications(
     db: Session = Depends(get_db),
     _user: dict = Depends(get_current_user),
 ):
+    key = f"products:spec:{product_id}"
+    cached = cache_get(key)
+    if cached is not None:
+        return cached
     rows = db.execute(
         text("""
             SELECT ps.id, ps.specification_id, s.name AS spec_name, ps.display_order
@@ -230,7 +254,9 @@ def get_product_specifications(
         """),
         {"pid": product_id},
     ).mappings().all()
-    return [dict(r) for r in rows]
+    result = [dict(r) for r in rows]
+    cache_set(key, result, ttl=600)
+    return result
 
 
 @router.put("/{product_id}/specifications", dependencies=[Depends(require_module("products_boq"))])
@@ -257,6 +283,7 @@ def set_product_specifications(
             {"pid": product_id, "sid": spec_id, "ord": order},
         )
     db.commit()
+    cache_bust("products")
     return get_product_specifications(product_id, db, _user)
 
 
@@ -270,6 +297,10 @@ def list_product_costs(
 ):
     """Return products with BOQ-computed material cost, paginated."""
     _ = user
+    key = f"products:costs:{page}:{page_size}:{q}"
+    cached = cache_get(key)
+    if cached is not None:
+        return cached
     limit = page_size
     offset = (page - 1) * page_size
 
@@ -332,13 +363,21 @@ def list_product_costs(
             text(f"SELECT COUNT(*) FROM products p {where}"), params
         ).scalar_one()
 
-    return {"items": result, "total": int(total), "page": page, "page_size": page_size}
+    costs_result = {"items": result, "total": int(total), "page": page, "page_size": page_size}
+    cache_set(key, costs_result, ttl=600)
+    return costs_result
 
 
 @router.get("/{product_id}")
 def get_product(product_id: int, db: Session = Depends(get_db), user: dict = Depends(get_current_user)):
     _ = user
-    return _product_dict(db, product_id)
+    key = f"products:item:{product_id}"
+    cached = cache_get(key)
+    if cached is not None:
+        return cached
+    result = _product_dict(db, product_id)
+    cache_set(key, result, ttl=600)
+    return result
 
 
 @router.post("", status_code=201, dependencies=[Depends(require_module("products_boq"))])
@@ -402,6 +441,7 @@ def create_product(
         )
 
     db.commit()
+    cache_bust("products")
     return _product_dict(db, pid)
 
 
@@ -426,6 +466,7 @@ def patch_product(
         sets.append("updated_at = now()")
         db.execute(text(f"UPDATE products SET {', '.join(sets)} WHERE id = :id"), params)
         db.commit()
+    cache_bust("products")
     return _product_dict(db, product_id)
 
 
@@ -579,6 +620,7 @@ def add_boq_line(
         {"pid": product_id, "bid": bid},
     )
     db.commit()
+    cache_bust("products")
     return _product_dict(db, product_id)
 
 
@@ -615,6 +657,7 @@ def patch_boq_line(
         params: dict = {"id": boq_id, **fields}
         db.execute(text(f"UPDATE bill_of_quantities SET {', '.join(sets)} WHERE id = :id"), params)
         db.commit()
+    cache_bust("products")
     return _product_dict(db, product_id)
 
 
@@ -728,6 +771,9 @@ async def bulk_upload_products(
         db.commit()
         created_names.append(prod_name)
 
+    if created_names:
+        cache_bust("products")
+
     return {
         "created": len(created_names),
         "skipped": len(skipped_names),
@@ -770,4 +816,5 @@ def remove_boq_line(
         {"id": boq_id},
     )
     db.commit()
+    cache_bust("products")
     return _product_dict(db, product_id)

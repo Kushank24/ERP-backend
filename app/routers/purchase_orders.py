@@ -11,6 +11,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
+from ..cache import cache_bust, cache_get, cache_set
 from ..db import get_db
 from ..deps import get_current_user, require_module
 from ..pdf_service import PDFGenerationService
@@ -183,6 +184,10 @@ def list_pos(
     user: dict = Depends(get_current_user),
 ):
     _ = user
+    key = f"po:list:{q}:{date_from}:{date_to}"
+    cached = cache_get(key)
+    if cached is not None:
+        return cached
     conds = []
     params: dict = {}
     if q and q.strip():
@@ -206,21 +211,35 @@ def list_pos(
         """),
         params,
     ).mappings().all()
-    return [dict(r) for r in rows]
+    result = [dict(r) for r in rows]
+    cache_set(key, result, ttl=180)
+    return result
 
 
 @router.get("/{po_id}")
 def get_po(po_id: int, db: Session = Depends(get_db), user: dict = Depends(get_current_user)):
     _ = user
-    return _serialize_po(db, po_id)
+    key = f"po:item:{po_id}"
+    cached = cache_get(key)
+    if cached is not None:
+        return cached
+    result = _serialize_po(db, po_id)
+    cache_set(key, result, ttl=180)
+    return result
 
 @router.get("/suppliers/list")
 def list_suppliers(db: Session = Depends(get_db), user: dict = Depends(get_current_user)):
     _ = user
+    key = "po:suppliers"
+    cached = cache_get(key)
+    if cached is not None:
+        return cached
     rows = db.execute(
         text("SELECT id, name AS supplier_name, location AS supplier_location, contact AS supplier_contact, gstin AS supplier_gstin FROM suppliers ORDER BY name")
     ).mappings().all()
-    return [dict(r) for r in rows]
+    result = [dict(r) for r in rows]
+    cache_set(key, result, ttl=600)
+    return result
 
 
 @router.post("", status_code=201, dependencies=[Depends(require_module("purchase_orders"))])
@@ -285,6 +304,7 @@ def create_po(
         )
 
     db.commit()
+    cache_bust("po")
     return _serialize_po(db, po_id)
 
 @router.patch("/{po_id}", dependencies=[Depends(require_module("purchase_orders"))])
@@ -375,6 +395,7 @@ def update_po(
         },
     )
     db.commit()
+    cache_bust("po")
     return _serialize_po(db, po_id)
 
 
@@ -444,6 +465,7 @@ def patch_po_status(
         {"s": body.status, "id": po_id},
     )
     db.commit()
+    cache_bust("po", "materials")
     result = _serialize_po(db, po_id)
     result["unit_warnings"] = unit_warnings
     return result
@@ -545,6 +567,7 @@ def receive_po_items(
         )
 
     db.commit()
+    cache_bust("po", "materials")
     result = _serialize_po(db, po_id)
     result["unit_warnings"] = unit_warnings
     return result
@@ -574,6 +597,7 @@ def update_additional_costs(po_id: int, body: AdditionalCostsBody, db: Session =
         {"ac": items_json, "total": new_total, "id": po_id},
     )
     db.commit()
+    cache_bust("po")
     return _serialize_po(db, po_id)
 
 
@@ -594,6 +618,7 @@ def delete_po(
     db.execute(text("DELETE FROM purchase_order_lines WHERE purchase_order_id = :id"), {"id": po_id})
     db.execute(text("DELETE FROM purchase_orders WHERE id = :id"), {"id": po_id})
     db.commit()
+    cache_bust("po")
 
 
 @router.get("/{po_id}/pdf")

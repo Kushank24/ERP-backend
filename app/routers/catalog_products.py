@@ -7,6 +7,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
+from ..cache import cache_bust, cache_get, cache_set
 from ..db import get_db
 from ..deps import get_current_user, require_module
 
@@ -46,10 +47,16 @@ def list_categories(
     db: Session = Depends(get_db),
     _user: dict = Depends(get_current_user),
 ):
+    key = "catalog:categories"
+    cached = cache_get(key)
+    if cached is not None:
+        return cached
     rows = db.execute(
         text("SELECT DISTINCT category FROM catalog_products WHERE category IS NOT NULL ORDER BY category")
     ).scalars().all()
-    return rows
+    result = list(rows)
+    cache_set(key, result, ttl=600)
+    return result
 
 
 @router.get("")
@@ -62,6 +69,10 @@ def list_catalog_products(
     db: Session = Depends(get_db),
     _user: dict = Depends(get_current_user),
 ):
+    key = f"catalog:list:{search}:{category}:{has_specs}:{page}:{page_size}"
+    cached = cache_get(key)
+    if cached is not None:
+        return cached
     conditions: list[str] = []
     params: dict = {}
 
@@ -103,7 +114,9 @@ def list_catalog_products(
         params,
     ).mappings().all()
 
-    return {"items": [dict(r) for r in rows], "total": total, "page": page, "page_size": page_size}
+    result = {"items": [dict(r) for r in rows], "total": total, "page": page, "page_size": page_size}
+    cache_set(key, result, ttl=600)
+    return result
 
 
 @router.get("/specifications/catalog")
@@ -111,6 +124,10 @@ def list_all_specifications(
     db: Session = Depends(get_db),
     _user: dict = Depends(get_current_user),
 ):
+    key = "catalog:spec_catalog"
+    cached = cache_get(key)
+    if cached is not None:
+        return cached
     rows = db.execute(
         text("""
             SELECT s.id, s.name, COUNT(cps.catalog_product_id)::int AS product_count
@@ -120,7 +137,9 @@ def list_all_specifications(
             ORDER BY s.name
         """)
     ).mappings().all()
-    return [dict(r) for r in rows]
+    result = [dict(r) for r in rows]
+    cache_set(key, result, ttl=600)
+    return result
 
 
 class SpecCreate(BaseModel):
@@ -144,6 +163,7 @@ def create_specification(
         {"name": body.name.strip()},
     ).mappings().first()
     db.commit()
+    cache_bust("catalog")
     return dict(row)
 
 
@@ -153,6 +173,10 @@ def get_specifications(
     db: Session = Depends(get_db),
     _user: dict = Depends(get_current_user),
 ):
+    key = f"catalog:spec:{cp_id}"
+    cached = cache_get(key)
+    if cached is not None:
+        return cached
     rows = db.execute(
         text("""
             SELECT cps.id, cps.specification_id, s.name AS spec_name, cps.display_order
@@ -163,7 +187,9 @@ def get_specifications(
         """),
         {"id": cp_id},
     ).mappings().all()
-    return [dict(r) for r in rows]
+    result = [dict(r) for r in rows]
+    cache_set(key, result, ttl=600)
+    return result
 
 
 @router.put("/{cp_id}/specifications", dependencies=[Depends(require_module("product_catalog"))])
@@ -195,6 +221,7 @@ def set_specifications(
             },
         )
     db.commit()
+    cache_bust("catalog")
     return get_specifications(cp_id, db, _user)
 
 
@@ -204,7 +231,13 @@ def get_catalog_product(
     db: Session = Depends(get_db),
     _user: dict = Depends(get_current_user),
 ):
-    return _row(db, cp_id)
+    key = f"catalog:item:{cp_id}"
+    cached = cache_get(key)
+    if cached is not None:
+        return cached
+    result = _row(db, cp_id)
+    cache_set(key, result, ttl=600)
+    return result
 
 
 @router.post("", status_code=201, dependencies=[Depends(require_module("product_catalog"))])
@@ -222,6 +255,7 @@ def create_catalog_product(
         {"model_name": body.model_name.strip(), "code": body.code, "category": body.category, "definition": body.definition},
     ).mappings().first()
     db.commit()
+    cache_bust("catalog")
     return _row(db, row["id"])
 
 
@@ -241,6 +275,7 @@ def patch_catalog_product(
             {"id": cp_id, **fields},
         )
         db.commit()
+    cache_bust("catalog")
     return _row(db, cp_id)
 
 
@@ -253,3 +288,4 @@ def delete_catalog_product(
     _row(db, cp_id)
     db.execute(text("DELETE FROM catalog_products WHERE id = :id"), {"id": cp_id})
     db.commit()
+    cache_bust("catalog")

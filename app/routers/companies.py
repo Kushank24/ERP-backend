@@ -7,6 +7,7 @@ from pydantic import BaseModel
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
+from ..cache import cache_bust, cache_get, cache_set
 from ..db import get_db
 from ..deps import get_current_user, require_module
 
@@ -40,6 +41,10 @@ def list_companies(
     db: Session = Depends(get_db),
     _user: dict = Depends(get_current_user),
 ):
+    key = f"companies:list:{q}:{limit}:{offset}"
+    cached = cache_get(key)
+    if cached is not None:
+        return cached
     where = ""
     params: dict = {}
     if q:
@@ -52,7 +57,9 @@ def list_companies(
         text(f"SELECT * FROM companies{where} ORDER BY name LIMIT :limit OFFSET :offset"),
         params,
     ).mappings().all()
-    return {"data": [dict(r) for r in rows], "total": total}
+    result = {"data": [dict(r) for r in rows], "total": total}
+    cache_set(key, result, ttl=600)
+    return result
 
 
 @router.post("", status_code=201, dependencies=[Depends(require_module("companies"))])
@@ -70,6 +77,7 @@ def create_company(
         body.model_dump(),
     ).mappings().first()
     db.commit()
+    cache_bust("companies")
     return _row(db, row["id"])
 
 
@@ -79,7 +87,13 @@ def get_company(
     db: Session = Depends(get_db),
     _user: dict = Depends(get_current_user),
 ):
-    return _row(db, company_id)
+    key = f"companies:item:{company_id}"
+    cached = cache_get(key)
+    if cached is not None:
+        return cached
+    result = _row(db, company_id)
+    cache_set(key, result, ttl=600)
+    return result
 
 
 @router.put("/{company_id}", dependencies=[Depends(require_module("companies"))])
@@ -100,6 +114,7 @@ def update_company(
         {**body.model_dump(), "id": company_id},
     )
     db.commit()
+    cache_bust("companies")
     return _row(db, company_id)
 
 
@@ -112,3 +127,4 @@ def delete_company(
     _row(db, company_id)
     db.execute(text("DELETE FROM companies WHERE id = :id"), {"id": company_id})
     db.commit()
+    cache_bust("companies")

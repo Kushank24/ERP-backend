@@ -13,6 +13,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
+from ..cache import cache_get, cache_set
 from ..db import get_db
 from ..deps import get_current_user, require_module
 from ..config import settings
@@ -241,6 +242,9 @@ def delete_campaign(
     db.commit()
 
 
+# Campaign reads below are deliberately uncached: list_campaigns, get_active
+# and get_failures all carry the live sent/failed counters the UI polls while a
+# send is in flight, and a cached counter reads as a frozen progress bar.
 @router.get("")
 def list_campaigns(db: Session = Depends(get_db), user: dict = Depends(get_current_user)):
     _ = user
@@ -257,10 +261,17 @@ def list_campaigns(db: Session = Depends(get_db), user: dict = Depends(get_curre
 @router.get("/contacts")
 def get_contacts(db: Session = Depends(get_db), user: dict = Depends(get_current_user)):
     _ = user
+    # Keyed under "companies" so the companies router's own busts clear it.
+    key = "companies:campaign_contacts"
+    cached = cache_get(key)
+    if cached is not None:
+        return cached
     rows = db.execute(
         text("SELECT name, email FROM companies WHERE email IS NOT NULL AND email <> '' ORDER BY name")
     ).mappings().all()
-    return [dict(r) for r in rows]
+    result = [dict(r) for r in rows]
+    cache_set(key, result, ttl=600)
+    return result
 
 
 @router.post("/parse-contacts", dependencies=[Depends(require_module("email_campaigns"))])

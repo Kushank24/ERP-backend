@@ -7,6 +7,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
+from ..cache import cache_get, cache_set
 from ..db import get_db
 from ..deps import get_current_user, require_module
 
@@ -28,6 +29,10 @@ def crm_analytics(
     date_from: Optional[str] = Query(None),
     date_to: Optional[str] = Query(None),
 ):
+    key = f"analytics:crm:{date_from}:{date_to}"
+    cached = cache_get(key)
+    if cached is not None:
+        return cached
     # Build separate filters for enquiries (enquiry_date) and offers (offer_date)
     enq_filter = ""
     enq_params: dict = {}
@@ -124,7 +129,7 @@ def crm_analytics(
             "won_value": float(r["won_value"] or 0),
         })
 
-    return {
+    crm_result = {
         "totals": {
             "enquiries": int(totals_row["enquiries"] or 0),
             "offers":    int(totals_row["offers"]    or 0),
@@ -142,6 +147,8 @@ def crm_analytics(
         },
         "monthly": monthly,
     }
+    cache_set(key, crm_result, ttl=300)
+    return crm_result
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -155,6 +162,10 @@ def list_companies_summary(
     date_from: Optional[str] = Query(None),
     date_to: Optional[str] = Query(None),
 ):
+    key = f"analytics:companies:{date_from}:{date_to}"
+    cached = cache_get(key)
+    if cached is not None:
+        return cached
     # Apply date filters to JOIN conditions so counts reflect the period
     enq_join_filter = ""
     off_join_filter = ""
@@ -180,7 +191,7 @@ def list_companies_summary(
         ORDER BY last_activity DESC NULLS LAST, c.name
     """), params).mappings().all()
 
-    return [
+    result = [
         {
             "id":             r["id"],
             "name":           r["name"],
@@ -190,6 +201,8 @@ def list_companies_summary(
         }
         for r in rows
     ]
+    cache_set(key, result, ttl=300)
+    return result
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -204,6 +217,10 @@ def company_analytics(
     date_from: Optional[str] = Query(None),
     date_to: Optional[str] = Query(None),
 ):
+    key = f"analytics:company:{company_id}:{date_from}:{date_to}"
+    cached = cache_get(key)
+    if cached is not None:
+        return cached
     company = db.execute(
         text("SELECT id, name, contact_person, phone, email, gstin FROM companies WHERE id = :id"),
         {"id": company_id},
@@ -352,7 +369,7 @@ def company_analytics(
     total_won   = sum(o["total_amount"] for o in offers_list if o["status"] == "accepted")
     win_rate    = round(100.0 * accepted / total_off, 1) if total_off else 0.0
 
-    return {
+    result = {
         "company": {
             "id":             company["id"],
             "name":           company["name"],
@@ -373,6 +390,8 @@ def company_analytics(
         "top_products":  top_products,
         "monthly_trend": monthly_trend,
     }
+    cache_set(key, result, ttl=300)
+    return result
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -386,6 +405,10 @@ def production_analytics(
     date_from: Optional[str] = Query(None),
     date_to: Optional[str] = Query(None),
 ):
+    key = f"analytics:production:{date_from}:{date_to}"
+    cached = cache_get(key)
+    if cached is not None:
+        return cached
     date_filter = ""
     date_params: dict = {}
     if date_from:
@@ -521,7 +544,7 @@ def production_analytics(
             mo = datetime.fromisoformat(mo)
         mat_monthly.append({"month": _fmt_month(mo), "count": int(r["cnt"] or 0)})
 
-    return {
+    result = {
         "work_orders": {
             "total":               total_wo,
             "in_progress":         in_progress,
@@ -544,6 +567,8 @@ def production_analytics(
         "top_materials": top_materials,
         "mat_monthly":   mat_monthly,
     }
+    cache_set(key, result, ttl=300)
+    return result
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -557,6 +582,10 @@ def list_production_clients(
     date_from: Optional[str] = Query(None),
     date_to: Optional[str] = Query(None),
 ):
+    key = f"analytics:production_clients:{date_from}:{date_to}"
+    cached = cache_get(key)
+    if cached is not None:
+        return cached
     date_filter = ""
     date_params: dict = {}
     if date_from:
@@ -582,7 +611,7 @@ def list_production_clients(
         ORDER BY last_wo DESC NULLS LAST, total DESC
     """), date_params).mappings().all()
 
-    return [
+    result = [
         {
             "name":        r["name"],
             "total":       int(r["total"]       or 0),
@@ -592,6 +621,8 @@ def list_production_clients(
         }
         for r in rows
     ]
+    cache_set(key, result, ttl=300)
+    return result
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -606,6 +637,10 @@ def production_client_analytics(
     date_from: Optional[str] = Query(None),
     date_to: Optional[str] = Query(None),
 ):
+    key = f"analytics:production_client:{name}:{date_from}:{date_to}"
+    cached = cache_get(key)
+    if cached is not None:
+        return cached
     date_filter = ""
     date_params: dict = {}
     if date_from:
@@ -705,7 +740,7 @@ def production_client_analytics(
             "completed": int(r["completed"] or 0),
         })
 
-    return {
+    result = {
         "client": {"name": name},
         "summary": {
             "total_wo":        total,
@@ -717,6 +752,8 @@ def production_client_analytics(
         "top_products":  top_products,
         "monthly_trend": monthly_trend,
     }
+    cache_set(key, result, ttl=300)
+    return result
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -730,6 +767,10 @@ def po_analytics(
     date_from: Optional[str] = Query(None),
     date_to: Optional[str] = Query(None),
 ):
+    key = f"analytics:po:{date_from}:{date_to}"
+    cached = cache_get(key)
+    if cached is not None:
+        return cached
     date_filter = ""
     date_params: dict = {}
     if date_from:
@@ -812,7 +853,7 @@ def po_analytics(
         for r in status_rows
     ]
 
-    return {
+    result = {
         "totals": {
             "total":       int(totals_row["total"]     or 0),
             "total_value": float(totals_row["total_value"] or 0),
@@ -827,6 +868,8 @@ def po_analytics(
         "top_suppliers":    top_suppliers,
         "status_breakdown": status_breakdown,
     }
+    cache_set(key, result, ttl=300)
+    return result
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -835,6 +878,10 @@ def po_analytics(
 
 @router.get("/po/suppliers", dependencies=[Depends(require_module("po_analytics"))])
 def list_po_suppliers(db: Session = Depends(get_db), _: dict = Depends(get_current_user)):
+    key = "analytics:po_suppliers"
+    cached = cache_get(key)
+    if cached is not None:
+        return cached
     rows = db.execute(text("""
         SELECT s.name,
                COUNT(p.id)          AS total_pos,
@@ -845,7 +892,7 @@ def list_po_suppliers(db: Session = Depends(get_db), _: dict = Depends(get_curre
         ORDER BY last_po DESC NULLS LAST, total_pos DESC
     """)).mappings().all()
 
-    return [
+    result = [
         {
             "name":       r["name"],
             "total_pos":  int(r["total_pos"] or 0),
@@ -853,6 +900,8 @@ def list_po_suppliers(db: Session = Depends(get_db), _: dict = Depends(get_curre
         }
         for r in rows
     ]
+    cache_set(key, result, ttl=300)
+    return result
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -865,6 +914,10 @@ def po_supplier_analytics(
     db: Session = Depends(get_db),
     _: dict = Depends(get_current_user),
 ):
+    key = f"analytics:po_supplier:{name}"
+    cached = cache_get(key)
+    if cached is not None:
+        return cached
     # Verify supplier exists
     supplier = db.execute(
         text("SELECT id FROM suppliers WHERE name = :name"),
@@ -971,7 +1024,7 @@ def po_supplier_analytics(
             "value": float(r["value"] or 0),
         })
 
-    return {
+    result = {
         "summary": {
             "total_pos":          total_pos,
             "total_value":        total_value,
@@ -983,6 +1036,8 @@ def po_supplier_analytics(
         "top_materials": top_materials,
         "monthly_trend": monthly_trend,
     }
+    cache_set(key, result, ttl=300)
+    return result
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -996,6 +1051,10 @@ def so_analytics(
     date_from: Optional[str] = Query(None),
     date_to: Optional[str] = Query(None),
 ):
+    key = f"analytics:so:{date_from}:{date_to}"
+    cached = cache_get(key)
+    if cached is not None:
+        return cached
     date_filter = ""
     date_params: dict = {}
     if date_from:
@@ -1081,7 +1140,7 @@ def so_analytics(
         for r in top_customers_rows
     ]
 
-    return {
+    result = {
         "totals": {
             "total":                    int(totals_row["total"]                    or 0),
             "total_revenue":            float(totals_row["total_revenue"]          or 0),
@@ -1098,6 +1157,8 @@ def so_analytics(
         "monthly":       monthly,
         "top_customers": top_customers,
     }
+    cache_set(key, result, ttl=300)
+    return result
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1106,6 +1167,10 @@ def so_analytics(
 
 @router.get("/so/customers", dependencies=[Depends(require_module("so_analytics"))])
 def list_so_customers(db: Session = Depends(get_db), _: dict = Depends(get_current_user)):
+    key = "analytics:so_customers"
+    cached = cache_get(key)
+    if cached is not None:
+        return cached
     rows = db.execute(text("""
         SELECT company_name AS name,
                COUNT(*)     AS total_sos,
@@ -1115,7 +1180,7 @@ def list_so_customers(db: Session = Depends(get_db), _: dict = Depends(get_curre
         ORDER BY last_so DESC NULLS LAST, total_sos DESC
     """)).mappings().all()
 
-    return [
+    result = [
         {
             "name":       r["name"],
             "total_sos":  int(r["total_sos"] or 0),
@@ -1123,6 +1188,8 @@ def list_so_customers(db: Session = Depends(get_db), _: dict = Depends(get_curre
         }
         for r in rows
     ]
+    cache_set(key, result, ttl=300)
+    return result
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1135,6 +1202,10 @@ def so_customer_analytics(
     db: Session = Depends(get_db),
     _: dict = Depends(get_current_user),
 ):
+    key = f"analytics:so_customer:{name}"
+    cached = cache_get(key)
+    if cached is not None:
+        return cached
     so_rows = db.execute(text("""
         SELECT id, invoice_number, sales_date, delivery_date,
                actual_delivery_date, status, total_amount, payment_amount
@@ -1232,7 +1303,7 @@ def so_customer_analytics(
             "payment": float(r["payment"] or 0),
         })
 
-    return {
+    result = {
         "summary": {
             "total_sos":              total_sos,
             "total_revenue":          total_revenue,
@@ -1244,3 +1315,5 @@ def so_customer_analytics(
         "top_products":  top_products,
         "monthly_trend": monthly_trend,
     }
+    cache_set(key, result, ttl=300)
+    return result

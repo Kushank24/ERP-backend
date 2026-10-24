@@ -4,6 +4,7 @@ from fastapi import APIRouter, Depends
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
+from ..cache import cache_get, cache_set
 from ..db import get_db
 from ..deps import get_current_user
 
@@ -16,6 +17,10 @@ FG_LOW = 5.0
 @router.get("/summary")
 def summary(db: Session = Depends(get_db), user: dict = Depends(get_current_user)):
     _ = user
+    key = "dashboard:summary"
+    cached = cache_get(key)
+    if cached is not None:
+        return cached
 
     rows = db.execute(
         text("""
@@ -82,7 +87,7 @@ def summary(db: Session = Depends(get_db), user: dict = Depends(get_current_user
     recent_enquiries = rows["recent_enquiries"] or []
     recent_offers = rows["recent_offers"] or []
 
-    return {
+    result = {
         "companies_count": int(counts["companies_count"] or 0),
         "enquiries_count": int(counts["enquiries_count"] or 0),
         "open_enquiries_count": int(counts["open_enquiries_count"] or 0),
@@ -105,3 +110,5 @@ def summary(db: Session = Depends(get_db), user: dict = Depends(get_current_user
         "recent_offers": [dict(r) for r in recent_offers],
         "low_stock_materials_sample": [dict(r) for r in low_mat_sample],
     }
+    cache_set(key, result, ttl=120)
+    return result

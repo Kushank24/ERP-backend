@@ -17,6 +17,7 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from .. import cloudinary_service
+from ..cache import cache_bust, cache_get, cache_set
 from ..db import get_db
 from ..deps import get_current_user, require_module
 from ..email_service import send_transactional_email
@@ -464,6 +465,10 @@ def list_so(
     user: dict = Depends(get_current_user),
 ):
     _ = user
+    key = f"so:list:{date_from}:{date_to}"
+    cached = cache_get(key)
+    if cached is not None:
+        return cached
     conds = []
     params: dict = {}
     if date_from:
@@ -484,12 +489,18 @@ def list_so(
         """),
         params,
     ).mappings().all()
-    return [dict(r) for r in rows]
+    result = [dict(r) for r in rows]
+    cache_set(key, result, ttl=180)
+    return result
 
 
 @router.get("/companies/list")
 def list_companies(db: Session = Depends(get_db), user: dict = Depends(get_current_user)):
     _ = user
+    key = "so:companies_list"
+    cached = cache_get(key)
+    if cached is not None:
+        return cached
     rows = db.execute(
         text(
             """
@@ -500,13 +511,21 @@ def list_companies(db: Session = Depends(get_db), user: dict = Depends(get_curre
             """
         )
     ).mappings().all()
-    return [dict(r) for r in rows]
+    result = [dict(r) for r in rows]
+    cache_set(key, result, ttl=600)
+    return result
 
 
 @router.get("/{so_id}")
 def get_so(so_id: int, db: Session = Depends(get_db), user: dict = Depends(get_current_user)):
     _ = user
-    return _serialize_so(db, so_id)
+    key = f"so:item:{so_id}"
+    cached = cache_get(key)
+    if cached is not None:
+        return cached
+    result = _serialize_so(db, so_id)
+    cache_set(key, result, ttl=180)
+    return result
 
 
 @router.post("", status_code=201, dependencies=[Depends(require_module("sales_orders"))])
@@ -673,6 +692,7 @@ def create_so(
         )
 
     db.commit()
+    cache_bust("so", "fg")
     return _serialize_so(db, so_id)
 
 
@@ -765,6 +785,7 @@ def update_so(
         },
     )
     db.commit()
+    cache_bust("so")
     return _serialize_so(db, so_id)
 
 
@@ -803,6 +824,7 @@ def update_payment(so_id: int, body: PaymentUpdate, db: Session = Depends(get_db
         },
     )
     db.commit()
+    cache_bust("so")
     return _serialize_so(db, so_id)
 
 
@@ -836,6 +858,7 @@ def update_additional_costs(so_id: int, body: AdditionalCostsBody, db: Session =
         {"ac": items_json, "total": new_total, "id": so_id},
     )
     db.commit()
+    cache_bust("so")
     return _serialize_so(db, so_id)
 
 
@@ -960,6 +983,7 @@ def dispatch_so(so_id: int, body: DispatchCreate, db: Session = Depends(get_db),
         )
 
     db.commit()
+    cache_bust("so", "fg")
     return _serialize_so(db, so_id)
 
 
@@ -971,4 +995,5 @@ def delete_so(so_id: int, db: Session = Depends(get_db), user: dict = Depends(ge
     db.execute(text("DELETE FROM sales_order_items WHERE sales_order_id = :id"), {"id": so_id})
     db.execute(text("DELETE FROM sales_orders WHERE id = :id"), {"id": so_id})
     db.commit()
+    cache_bust("so")
 

@@ -79,6 +79,15 @@ class Settings(BaseSettings):
         "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
     )
 
+    # ------------------------------------------------------------------ #
+    # Upstash Redis (response caching)                                     #
+    # ------------------------------------------------------------------ #
+    upstash_redis_rest_url: str = ""
+    upstash_redis_rest_token: str = ""
+
+    # ------------------------------------------------------------------ #
+    # Supabase admin e-mails                                               #
+    # ------------------------------------------------------------------ #
     # Comma-separated list of Supabase user e-mail addresses that always
     # receive admin access, regardless of their metadata role.
     # Example:  SUPABASE_ADMIN_EMAILS=alice@example.com,bob@example.com

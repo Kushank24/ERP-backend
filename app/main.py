@@ -9,6 +9,7 @@ from sqlalchemy.exc import OperationalError, SQLAlchemyError
 
 from .config import settings
 from .deps import require_any_module
+from .http_cache import ETagMiddleware
 from .logging_config import configure_logging
 from .db import SessionLocal
 from .routers import (
@@ -44,6 +45,17 @@ def _bootstrap_email_campaigns() -> None:
         email_campaigns.ensure_tables_once(db)
     finally:
         db.close()
+
+# ---------------------------------------------------------------------------
+# Conditional requests (ETag)
+# ---------------------------------------------------------------------------
+# Registered *before* CORS on purpose. Starlette inserts each middleware at the
+# front of the stack, so the last one added is the outermost — CORS has to stay
+# outermost or the 304 responses this produces would go out without the
+# Access-Control-* headers the browser needs to accept them.
+# ---------------------------------------------------------------------------
+
+app.add_middleware(ETagMiddleware)
 
 # ---------------------------------------------------------------------------
 # CORS

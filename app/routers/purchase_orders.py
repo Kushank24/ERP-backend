@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import logging
 from datetime import date
-from typing import List, Optional
+from typing import List, Literal, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import StreamingResponse
@@ -15,6 +15,7 @@ from ..cache import cache_bust, cache_get, cache_set
 from ..db import get_db
 from ..deps import get_current_user, require_module
 from ..pdf_service import PDFGenerationService
+from ..rounding import compute_round_off, normalize_mode
 from ..unit_conversion import convert_qty as _convert_qty
 
 logger = logging.getLogger(__name__)
@@ -143,7 +144,9 @@ def _serialize_po(db: Session, po_id: int) -> dict:
             """
             SELECT p.id, p.purchase_number, p.purchase_date, p.total_amount, p.order_delivery_date,
                    p.status, p.gst_rate, p.actual_delivery_date, p.bill_numbers, p.delivery_details,
-                   p.remarks, COALESCE(p.additional_costs, '[]'::jsonb) AS additional_costs,
+                   p.remarks, COALESCE(p.round_off, 0) AS round_off,
+                   COALESCE(p.round_off_mode, 'none') AS round_off_mode,
+                   COALESCE(p.additional_costs, '[]'::jsonb) AS additional_costs,
                    s.name AS supplier_name, s.location AS supplier_location, s.contact AS supplier_contact,
                    s.gstin AS supplier_gstin
             FROM purchase_orders p
@@ -172,7 +175,63 @@ def _serialize_po(db: Session, po_id: int) -> dict:
     if d.get("additional_costs") is None:
         d["additional_costs"] = []
     d["lines"] = [dict(x) for x in lines]
+    d["round_off"] = float(d.get("round_off") or 0)
     return d
+
+
+def _round_off_inputs(db: Session, po_id: int) -> tuple[float, str]:
+    """
+    (base grand total, stored round-off mode) for a purchase order. The base is
+    lines + extra costs, plus GST on that sum — the figure the detail screen and
+    the PDF show before any round-off.
+
+    Note this is *not* `purchase_orders.total_amount`, which by long-standing
+    convention here holds the pre-GST figure (lines + extra costs). The
+    round-off is a correction to the grand total, so it is derived from this
+    value and kept in its own column rather than folded into total_amount.
+
+    One query rather than three: this runs on every edit, and the database is
+    remote, so each extra round trip is latency the user waits through.
+    """
+    row = db.execute(
+        text(
+            """
+            SELECT gst_rate,
+                   COALESCE(round_off_mode, 'none') AS round_off_mode,
+                   COALESCE(additional_costs, '[]'::jsonb) AS additional_costs,
+                   COALESCE(
+                     (SELECT SUM(length_weight_nos * per_unit_cost)
+                      FROM purchase_order_lines WHERE purchase_order_id = :id), 0
+                   ) AS lines_total
+            FROM purchase_orders WHERE id = :id
+            """
+        ),
+        {"id": po_id},
+    ).mappings().first()
+    if not row:
+        raise HTTPException(404, "Purchase order not found")
+    items = row["additional_costs"]
+    if isinstance(items, str):
+        items = json.loads(items)
+    extra = sum(float(i.get("amount") or 0) for i in (items or []))
+    gst_base = float(row["lines_total"]) + extra
+    base = gst_base + gst_base * (float(row["gst_rate"]) / 100.0)
+    return base, normalize_mode(row["round_off_mode"])
+
+
+def _reapply_round_off(db: Session, po_id: int, mode: Optional[str] = None) -> None:
+    """
+    Re-derive the stored round-off delta from the order's current base grand
+    total. Pass `mode` to also set the direction (the round-off endpoint); omit
+    it to keep the stored one, which is what every other edit does — lines,
+    extra costs and GST rate all move the base, and the delta has to follow.
+    """
+    base, stored_mode = _round_off_inputs(db, po_id)
+    mode = normalize_mode(mode) if mode is not None else stored_mode
+    db.execute(
+        text("UPDATE purchase_orders SET round_off_mode = :mode, round_off = :ro WHERE id = :id"),
+        {"mode": mode, "ro": compute_round_off(base, mode), "id": po_id},
+    )
 
 
 @router.get("")
@@ -394,6 +453,8 @@ def update_po(
             "total": new_total, "id": po_id,
         },
     )
+    # The base grand total just moved — re-derive the round-off delta for it.
+    _reapply_round_off(db, po_id)
     db.commit()
     cache_bust("po")
     return _serialize_po(db, po_id)
@@ -596,6 +657,28 @@ def update_additional_costs(po_id: int, body: AdditionalCostsBody, db: Session =
         text("UPDATE purchase_orders SET additional_costs = CAST(:ac AS jsonb), total_amount = :total, updated_at = now() WHERE id = :id"),
         {"ac": items_json, "total": new_total, "id": po_id},
     )
+    _reapply_round_off(db, po_id)
+    db.commit()
+    cache_bust("po")
+    return _serialize_po(db, po_id)
+
+
+class RoundOffBody(BaseModel):
+    # 'down' = floor to the whole rupee, 'up' = ceil, 'none' = remove it
+    mode: Literal["none", "down", "up"]
+
+
+@router.patch("/{po_id}/round-off", dependencies=[Depends(require_module("purchase_orders"))])
+def update_round_off(po_id: int, body: RoundOffBody, db: Session = Depends(get_db), user: dict = Depends(get_current_user)):
+    """
+    Round the grand total down or up to the nearest whole rupee, or clear the
+    round-off. Only the direction comes from the client — the delta itself is
+    derived from the server's own base grand total.
+    """
+    _ = user
+    # _reapply_round_off raises 404 itself if the order is gone, so this is a
+    # single SELECT + single UPDATE — no separate existence check.
+    _reapply_round_off(db, po_id, mode=body.mode)
     db.commit()
     cache_bust("po")
     return _serialize_po(db, po_id)
@@ -653,6 +736,7 @@ def download_po_pdf(
         ],
         "PurchaseGST": float(po.get("gst_rate") or 18),
         "AdditionalCosts": po.get("additional_costs") or [],
+        "RoundOff": float(po.get("round_off") or 0),
         "DeliveryDetails": po.get("delivery_details") or {},
         "Variant": variant,
     }

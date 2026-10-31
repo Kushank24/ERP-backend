@@ -278,18 +278,23 @@ class PDFGenerationService:
             gst_pct /= 100
         gst_base = subtotal + extra_total
         gst_amt = gst_base * gst_pct
-        total = gst_base + gst_amt
+        round_off = float(data.get("RoundOff") or 0)
+        total = gst_base + gst_amt + round_off
 
         n = len(materials)
         subtotal_row = n + 1
         extra_row_start = n + 2
         gst_row = n + 2 + len(extra_costs)
-        total_row = n + 3 + len(extra_costs)
+        # The round-off row sits between GST and TOTAL, and only when applied.
+        has_round_off = round(round_off, 2) != 0
+        total_row = gst_row + (2 if has_round_off else 1)
 
         rows.append(["SUBTOTAL", "", "", "", "", f"Rs.{subtotal:.2f}"])
         for ec in extra_costs:
             rows.append([ec.get("label", "Extra Cost"), "", "", "", "", f"Rs.{float(ec.get('amount', 0)):.2f}"])
         rows.append([f"GST ({int(gst_pct * 100)}%)", "", "", "", "", f"Rs.{gst_amt:.2f}"])
+        if has_round_off:
+            rows.append(["ROUND OFF", "", "", "", "", f"Rs.{round_off:+.2f}"])
         rows.append(["TOTAL", "", "", "", "", f"Rs.{total:.2f}"])
 
         tbl = Table(rows, colWidths=[40, 200, 80, 60, 70, 70])
@@ -318,6 +323,8 @@ class PDFGenerationService:
         ]
         for i in range(len(extra_costs)):
             styles.append(("SPAN", (0, extra_row_start + i), (4, extra_row_start + i)))
+        if has_round_off:
+            styles.append(("SPAN", (0, gst_row + 1), (4, gst_row + 1)))
         tbl.setStyle(TableStyle(styles))
         elements.append(tbl)
         elements.append(Spacer(1, 8))

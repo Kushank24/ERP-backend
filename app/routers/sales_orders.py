@@ -21,6 +21,7 @@ from ..cache import cache_bust, cache_get, cache_set
 from ..db import get_db
 from ..deps import get_current_user, require_module
 from ..email_service import send_transactional_email
+from ..rounding import compute_round_off, normalize_mode
 from ..upload_limits import read_limited
 
 logger = logging.getLogger(__name__)
@@ -241,6 +242,7 @@ def _serialize_so(db: Session, so_id: int) -> dict:
                    sales_date, delivery_date, actual_delivery_date, total_amount, status, gst_rate,
                    payment_status, dispatch_status,
                    delivery_details, notes, created_at, updated_at, payment_received, payment_amount,
+                   COALESCE(round_off, 0) AS round_off, COALESCE(round_off_mode, 'none') AS round_off_mode,
                    COALESCE(additional_costs, '[]'::jsonb) AS additional_costs,
                    invoice_document, eway_bill_document, lr_copy_document
             FROM sales_orders WHERE id = :id
@@ -273,7 +275,62 @@ def _serialize_so(db: Session, so_id: int) -> dict:
     subtotal = sum(float(x["total_price"]) for x in d["lines"])
     d["subtotal"] = subtotal
     d["gst_amount"] = subtotal * (float(d["gst_rate"]) / 100.0)
+    d["round_off"] = float(d.get("round_off") or 0)
     return d
+
+
+def _round_off_inputs(db: Session, so_id: int) -> tuple[float, str]:
+    """
+    (base grand total, stored round-off mode) for a sales order. The base is
+    lines + extra costs, plus GST on that sum — what the detail screen shows
+    before any round-off.
+
+    One query rather than three: this runs on every edit, and the database is
+    remote, so each extra round trip is latency the user waits through.
+    """
+    row = db.execute(
+        text(
+            """
+            SELECT gst_rate,
+                   COALESCE(round_off_mode, 'none') AS round_off_mode,
+                   COALESCE(additional_costs, '[]'::jsonb) AS additional_costs,
+                   COALESCE(
+                     (SELECT SUM(total_price) FROM sales_order_items WHERE sales_order_id = :id), 0
+                   ) AS subtotal
+            FROM sales_orders WHERE id = :id
+            """
+        ),
+        {"id": so_id},
+    ).mappings().first()
+    if not row:
+        raise HTTPException(404, "Sales order not found")
+    items = row["additional_costs"]
+    if isinstance(items, str):
+        items = json.loads(items)
+    extra = sum(float(i.get("amount") or 0) for i in (items or []))
+    gst_base = float(row["subtotal"]) + extra
+    base = gst_base + gst_base * (float(row["gst_rate"]) / 100.0)
+    return base, normalize_mode(row["round_off_mode"])
+
+
+def _reapply_round_off(db: Session, so_id: int, mode: Optional[str] = None) -> None:
+    """
+    Re-derive the stored round-off delta and total_amount from the order's
+    current base total. Pass `mode` to also set the direction (the round-off
+    endpoint); omit it to keep the stored one, which is what every other edit
+    does — lines, extra costs and GST rate all move the base, and the delta
+    has to follow.
+    """
+    base, stored_mode = _round_off_inputs(db, so_id)
+    mode = normalize_mode(mode) if mode is not None else stored_mode
+    delta = compute_round_off(base, mode)
+    db.execute(
+        text(
+            "UPDATE sales_orders SET round_off_mode = :mode, round_off = :ro, "
+            "total_amount = :total WHERE id = :id"
+        ),
+        {"mode": mode, "ro": delta, "total": round(base, 2) + delta, "id": so_id},
+    )
 
 
 @router.post("/upload-document", dependencies=[Depends(require_module("sales_orders"))])
@@ -729,10 +786,8 @@ def update_so(
         if lid not in incoming_ids:
             db.execute(text("DELETE FROM sales_order_items WHERE id = :id"), {"id": lid})
 
-    new_subtotal = 0.0
     for line in body.lines:
         tp = float(line.quantity_sold) * float(line.unit_price)
-        new_subtotal += tp
         if line.id and line.id in current_lines:
             dispatched = float(current_lines[line.id]["dispatched_qty"] or 0)
             if line.quantity_sold < dispatched:
@@ -761,14 +816,11 @@ def update_so(
                  "tp": tp, "notes": line.notes},
             )
 
-    gst_amt = new_subtotal * (body.gst_rate / 100.0)
-    new_total = new_subtotal + gst_amt
-
     db.execute(
         text(
             "UPDATE sales_orders SET company_name=:cname, company_location=:cloc, company_contact=:ccon, "
             "company_gstin=:gstin, sales_date=:sdate, delivery_date=:ddate, gst_rate=:grate, "
-            "delivery_details=CAST(:details AS jsonb), notes=:notes, total_amount=:total, "
+            "delivery_details=CAST(:details AS jsonb), notes=:notes, "
             "invoice_document=CAST(:invoice_doc AS jsonb), eway_bill_document=CAST(:eway_doc AS jsonb), "
             "lr_copy_document=CAST(:lr_doc AS jsonb), "
             "updated_at=now() "
@@ -778,12 +830,15 @@ def update_so(
             "cname": body.company_name.strip(), "cloc": body.company_location, "ccon": body.company_contact,
             "gstin": body.company_gstin, "sdate": body.sales_date, "ddate": body.delivery_date,
             "grate": body.gst_rate, "details": json.dumps(body.delivery_details or {}),
-            "notes": body.notes, "total": new_total, "id": so_id,
+            "notes": body.notes, "id": so_id,
             "invoice_doc": json.dumps(body.invoice_document) if body.invoice_document else None,
             "eway_doc": json.dumps(body.eway_bill_document) if body.eway_bill_document else None,
             "lr_doc": json.dumps(body.lr_copy_document) if body.lr_copy_document else None,
         },
     )
+    # Recomputes total_amount from the new lines, the extra costs and the GST
+    # rate, then re-applies the chosen round-off direction to the new base.
+    _reapply_round_off(db, so_id)
     db.commit()
     cache_bust("so")
     return _serialize_so(db, so_id)
@@ -838,25 +893,38 @@ class AdditionalCostsBody(BaseModel):
 @router.patch("/{so_id}/additional-costs", dependencies=[Depends(require_module("sales_orders"))])
 def update_additional_costs(so_id: int, body: AdditionalCostsBody, db: Session = Depends(get_db), user: dict = Depends(get_current_user)):
     _ = user
-    row = db.execute(
-        text("SELECT gst_rate FROM sales_orders WHERE id = :id"), {"id": so_id}
-    ).first()
-    if not row:
+    if not db.execute(text("SELECT id FROM sales_orders WHERE id = :id"), {"id": so_id}).first():
         raise HTTPException(404, "Sales order not found")
-    subtotal = db.execute(
-        text("SELECT COALESCE(SUM(total_price), 0) FROM sales_order_items WHERE sales_order_id = :id"),
-        {"id": so_id},
-    ).scalar()
-    subtotal = float(subtotal or 0)
-    extra = sum(float(i.amount) for i in body.items)
-    gst_base = subtotal + extra
-    gst_amt = gst_base * (float(row.gst_rate) / 100.0)
-    new_total = gst_base + gst_amt
     items_json = json.dumps([{"label": i.label, "amount": i.amount} for i in body.items])
     db.execute(
-        text("UPDATE sales_orders SET additional_costs = CAST(:ac AS jsonb), total_amount = :total, updated_at = now() WHERE id = :id"),
-        {"ac": items_json, "total": new_total, "id": so_id},
+        text("UPDATE sales_orders SET additional_costs = CAST(:ac AS jsonb), updated_at = now() WHERE id = :id"),
+        {"ac": items_json, "id": so_id},
     )
+    # total_amount is derived from the costs just written, with the chosen
+    # round-off direction re-applied to the new base.
+    _reapply_round_off(db, so_id)
+    db.commit()
+    cache_bust("so")
+    return _serialize_so(db, so_id)
+
+
+class RoundOffBody(BaseModel):
+    # 'down' = floor to the whole rupee, 'up' = ceil, 'none' = remove it
+    mode: Literal["none", "down", "up"]
+
+
+@router.patch("/{so_id}/round-off", dependencies=[Depends(require_module("sales_orders"))])
+def update_round_off(so_id: int, body: RoundOffBody, db: Session = Depends(get_db), user: dict = Depends(get_current_user)):
+    """
+    Round the grand total down or up to the nearest whole rupee, or clear the
+    round-off. Only the direction comes from the client — the delta itself is
+    derived from the server's own base total, so it can never disagree with
+    the stored total_amount.
+    """
+    _ = user
+    # _reapply_round_off raises 404 itself if the order is gone, so this is a
+    # single SELECT + single UPDATE — no separate existence check.
+    _reapply_round_off(db, so_id, mode=body.mode)
     db.commit()
     cache_bust("so")
     return _serialize_so(db, so_id)

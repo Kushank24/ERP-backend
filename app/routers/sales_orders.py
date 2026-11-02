@@ -124,6 +124,70 @@ def _fmt_money(amount: float) -> str:
     return f"₹{amount:,.2f}"
 
 
+def _summary_rows(so: dict, goods_subtotal: float) -> List[str]:
+    """
+    The cost breakdown that closes the items table in the customer email:
+    subtotal, every extra cost by its own label (packing, freight, …), GST,
+    any round-off, then the grand total.
+
+    Before this existed the email showed the product lines and then an Order
+    Total that silently included the extra costs and the GST, so a customer
+    adding up the rows could not arrive at the figure they were being asked to
+    pay. Every component is now named.
+
+    Every figure is derived from the rows actually printed above, so the
+    arithmetic in a customer's hands adds up — a total that does not equal the
+    sum of the visible rows is the bug this whole breakdown exists to end.
+    That also means the email agrees with the order's detail screen, which
+    composes its Grand Total the same way.
+
+    It does *not* simply print the stored total_amount, because for 16 of the
+    51 orders carrying extra costs that column is stale: an earlier update_so
+    recomputed it without additional_costs, so editing an order silently
+    dropped its packing charge from the stored total. Those rows are short by
+    exactly the extras plus their GST. The mismatch is logged on every send so
+    the drift stays visible until the column is backfilled.
+    """
+    extras = [c for c in (so.get("additional_costs") or []) if float(c.get("amount") or 0) != 0]
+    extra_total = sum(float(c.get("amount") or 0) for c in extras)
+    gst_rate = float(so.get("gst_rate") or 0)
+    gst_amount = (goods_subtotal + extra_total) * (gst_rate / 100.0)
+    round_off = float(so.get("round_off") or 0)
+    grand_total = goods_subtotal + extra_total + gst_amount + round_off
+
+    stored = float(so["total_amount"])
+    if abs(grand_total - stored) >= 0.01:
+        logger.warning(
+            "Sales order %s: emailing a grand total of %.2f (subtotal %.2f + extras "
+            "%.2f + GST %.2f + round-off %.2f) but total_amount holds %.2f — stale "
+            "stored total, difference %.2f",
+            so.get("invoice_number"), grand_total, goods_subtotal, extra_total,
+            gst_amount, round_off, stored, grand_total - stored,
+        )
+
+    def row(label: str, amount: str, *, strong: bool = False, border: bool = False) -> str:
+        weight = "font-weight:600;" if strong else ""
+        top = "border-top:1px solid #e2e2e2;" if border else ""
+        return (
+            f"<tr>"
+            f"<td colspan='3' style='padding:4px 12px 4px 0;text-align:right;{weight}{top}'>{label}</td>"
+            f"<td style='padding:4px 12px;text-align:right;{weight}{top}'>{amount}</td>"
+            f"</tr>"
+        )
+
+    out = [row("Subtotal", _fmt_money(goods_subtotal), border=True)]
+    for cost in extras:
+        out.append(row(escape(str(cost.get("label") or "Other Charges")), _fmt_money(float(cost["amount"]))))
+    if gst_rate:
+        # ":g" so 17.5 prints as 17.5, not 17 or 17.50.
+        out.append(row(f"GST ({gst_rate:g}%)", _fmt_money(gst_amount)))
+    if round(round_off, 2) != 0:
+        sign = "−" if round_off < 0 else "+"
+        out.append(row("Round Off", f"{sign}{_fmt_money(abs(round_off))}"))
+    out.append(row("Grand Total", _fmt_money(grand_total), strong=True, border=True))
+    return out
+
+
 def _build_so_email_html(so: dict, attached_labels: List[str]) -> tuple[str, str]:
     """
     Returns (subject, html) for the sales-order document email. `so` is the
@@ -151,18 +215,24 @@ def _build_so_email_html(so: dict, attached_labels: List[str]) -> tuple[str, str
             consolidated[key] = {"name": label, "unit_price": up, "qty": float(line["quantity_sold"])}
 
     rows = []
+    goods_subtotal = 0.0
     for entry in consolidated.values():
         total_qty = entry["qty"]
         up = entry["unit_price"]
+        line_total = up * total_qty
+        goods_subtotal += line_total
         qty_display = int(total_qty) if total_qty == int(total_qty) else total_qty
         rows.append(
             f"<tr>"
             f"<td style='padding:4px 12px 4px 0'>{entry['name']}</td>"
             f"<td style='padding:4px 12px;text-align:right'>{qty_display}</td>"
             f"<td style='padding:4px 12px;text-align:right'>{_fmt_money(up)}</td>"
-            f"<td style='padding:4px 12px;text-align:right'>{_fmt_money(up * total_qty)}</td>"
+            f"<td style='padding:4px 12px;text-align:right'>{_fmt_money(line_total)}</td>"
             f"</tr>"
         )
+
+    rows.extend(_summary_rows(so, goods_subtotal))
+
     items_table = (
         f"<table style='margin:12px 0;font-size:14px;width:100%;border-collapse:collapse'>"
         f"<tr style='font-weight:600;color:#555;border-bottom:1px solid #e2e2e2'>"
@@ -183,7 +253,6 @@ def _build_so_email_html(so: dict, attached_labels: List[str]) -> tuple[str, str
     )
 
     subject = f"Sales Order {invoice_number} — Documents from E-SAFE Enterprises"
-    total_amount = _fmt_money(float(so["total_amount"]))
 
     html = f"""
     <div style="font-family:Arial,sans-serif;font-size:14px;line-height:1.6;color:#222">
@@ -193,7 +262,6 @@ def _build_so_email_html(so: dict, attached_labels: List[str]) -> tuple[str, str
         along with the associated documents.
       </p>
       {items_table}
-      <p style="margin:0 0 12px"><strong>Order Total: {total_amount}</strong></p>
       {docs_sentence}
       <p>Please feel free to reach out with any questions regarding this order.</p>
       <p>
@@ -274,7 +342,10 @@ def _serialize_so(db: Session, so_id: int) -> dict:
     d["lines"] = [dict(x) for x in lines]
     subtotal = sum(float(x["total_price"]) for x in d["lines"])
     d["subtotal"] = subtotal
-    d["gst_amount"] = subtotal * (float(d["gst_rate"]) / 100.0)
+    # GST applies to the extra costs as well, not just the goods — the same
+    # base _base_total() and the detail screen use.
+    extra = sum(float(c.get("amount") or 0) for c in (d["additional_costs"] or []))
+    d["gst_amount"] = (subtotal + extra) * (float(d["gst_rate"]) / 100.0)
     d["round_off"] = float(d.get("round_off") or 0)
     return d
 

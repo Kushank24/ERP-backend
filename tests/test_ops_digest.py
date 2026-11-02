@@ -11,14 +11,15 @@ Three sections, all standing recurring lists — no dedup, no one-time trigger:
     ~47 rows of real signal. (This section originally ran as an exact-day
     trigger, matching the offer-reminder pattern, but was changed to a
     standing list to show every currently-unpaid order, not just the ones
-    that happened to turn 10 days old today.)
-  - Upcoming deliveries: orders with delivery_date in the next N days,
-    regardless of dispatch_status — the same order is expected to appear on
-    consecutive days as its delivery date approaches, which is intentional.
+    that happened to turn 10 days old today.) The money column shows what is
+    still owed, so a part-paid order shows total minus the recorded payment.
+  - Upcoming deliveries: work orders whose delivery_date falls in the next N
+    days, with completed/in-progress status — the same work order is expected
+    to appear on consecutive days as its date approaches, which is intentional.
 
 These tests pin the exclusion of NULL payment_status (the one subtlety in an
-otherwise "just list everything" design) and the standing-list nature of all
-three sections.
+otherwise "just list everything" design), the outstanding-not-total money
+column, and the standing-list nature of all three sections.
 """
 
 from __future__ import annotations
@@ -34,6 +35,7 @@ from app.jobs.ops_digest import (
     _build_digest,
     _fmt_date,
     _fmt_money,
+    _outstanding,
     run,
 )
 
@@ -42,17 +44,19 @@ def _wo(id_=1, number="WO/1", party="Acme", created="2026-09-01"):
     return {"id": id_, "work_order_number": number, "party_name": party, "creation_date": created}
 
 
-def _unpaid(id_=1, inv="INV/1", company="Acme", date="2026-09-11", amt=1000.0, status=1):
+def _unpaid(id_=1, inv="INV/1", company="Acme", date="2026-09-11", amt=1000.0, status=1, paid=None):
     return {
         "id": id_, "invoice_number": inv, "company_name": company,
         "sales_date": date, "total_amount": amt, "payment_status": status,
+        "payment_amount": paid,
     }
 
 
-def _delivery(id_=1, inv="INV/1", company="Acme", date="2026-09-25", amt=1000.0, dispatch=1):
+def _delivery(id_=1, number="WO/1", party="Acme", date="2026-09-25", status="in-progress"):
+    """A work order due for delivery — section 3 is driven by work_orders."""
     return {
-        "id": id_, "invoice_number": inv, "company_name": company,
-        "delivery_date": date, "total_amount": amt, "dispatch_status": dispatch,
+        "id": id_, "work_order_number": number, "party_name": party,
+        "delivery_date": date, "status": status,
     }
 
 
@@ -106,7 +110,7 @@ def test_empty_sections_show_a_clear_none_message_not_a_blank_table():
     _, html = _build_digest([], [], [])
     assert "No work orders currently open." in html
     assert "No unpaid sales orders." in html
-    assert f"next {DELIVERY_WINDOW_DAYS} days" in html
+    assert f"No work orders due for delivery in the next {DELIVERY_WINDOW_DAYS} days." in html
 
 
 def test_work_order_section_lists_number_party_and_created_date():
@@ -131,30 +135,97 @@ def test_unpaid_section_handles_unknown_status_gracefully():
     assert "Unknown" in html
 
 
-def test_delivery_section_shows_dispatch_status_label():
-    _, html = _build_digest([], [], [_delivery(dispatch=4)])
-    assert "Fully Dispatched" in html
+def test_delivery_section_shows_work_order_status_label_not_raw_enum():
+    _, html = _build_digest([], [], [_delivery(status="in-progress")])
+    delivery_section = html.split("3. Upcoming")[-1]
+    assert "In Progress" in delivery_section
+    assert "in-progress" not in delivery_section
 
 
-def test_delivery_section_does_not_show_the_order_amount():
+def test_delivery_section_does_not_show_any_amount():
     """
-    Explicit design decision: unpaid orders show amount (relevant to
-    collections); upcoming deliveries do not (it's a logistics list, not a
-    money one). Guards against the column silently coming back.
+    Explicit design decision: unpaid orders show money (relevant to
+    collections); upcoming deliveries do not (it's a logistics list). Guards
+    against the column silently coming back.
     """
-    _, html = _build_digest([], [], [_delivery(amt=123456.78)])
+    _, html = _build_digest([], [], [_delivery()])
     delivery_section = html.split("3. Upcoming")[-1]
     assert "₹" not in delivery_section
 
 
-def test_delivery_section_includes_already_dispatched_orders():
+def test_delivery_section_includes_completed_work_orders():
     """
-    Explicit design decision: unlike the unpaid-orders section, this is a pure
-    calendar heads-up. All 6 real matches on the day this was built were
-    already dispatch_status=4, and the decision was to show them anyway.
+    Explicit design decision: this is a calendar heads-up, so a work order due
+    in the window is listed whether or not it is finished — "due Thursday, and
+    done" is as much a planning fact as "due Thursday, not started".
     """
-    _, html = _build_digest([], [], [_delivery(inv="INV/999", dispatch=4)])
-    assert "INV/999" in html
+    _, html = _build_digest([], [], [_delivery(number="WO/999", status="completed")])
+    assert "WO/999" in html
+    assert "Completed" in html
+
+
+def test_delivery_section_is_driven_by_work_orders_not_invoices():
+    """
+    Pinned against reverting to sales_orders.delivery_date: the work order is
+    where the promised date is actually maintained, and its completion status
+    is the point of the section.
+    """
+    _, html = _build_digest([], [], [_delivery(number="WO/26-27/0290", party="Nippon Steel")])
+    delivery_section = html.split("3. Upcoming")[-1]
+    assert "Work Order" in delivery_section
+    assert "WO/26-27/0290" in delivery_section
+    assert "Nippon Steel" in delivery_section
+
+
+def test_delivery_section_tolerates_an_unmapped_status():
+    """A new enum value must show through, not crash or render as 'None'."""
+    _, html = _build_digest([], [], [_delivery(status="on-hold")])
+    assert "on-hold" in html
+
+
+# ---------------------------------------------------------------------------
+# Outstanding amount: what is owed, not what was invoiced
+# ---------------------------------------------------------------------------
+
+
+def test_outstanding_on_a_not_received_order_is_the_whole_total():
+    assert _outstanding(_unpaid(amt=1000.0, status=1)) == 1000.0
+
+
+def test_outstanding_on_a_partly_received_order_subtracts_the_payment():
+    assert _outstanding(_unpaid(amt=946596.0, status=2, paid=917717.0)) == 28879.0
+
+
+def test_outstanding_falls_back_to_the_total_when_no_payment_was_recorded():
+    """
+    A Partially Received order with payment_amount NULL: nothing is known to
+    have come in, so showing it as paid off would be the worse error.
+    """
+    assert _outstanding(_unpaid(amt=1000.0, status=2, paid=None)) == 1000.0
+
+
+def test_outstanding_never_goes_negative():
+    assert _outstanding(_unpaid(amt=1000.0, status=2, paid=1500.0)) == 0.0
+
+
+def test_unpaid_section_shows_the_outstanding_amount_not_the_order_total():
+    _, html = _build_digest([], [_unpaid(amt=946596.0, status=2, paid=917717.0)], [])
+    unpaid_section = html.split("2. Unpaid")[-1].split("3. Upcoming")[0]
+    assert "₹28,879.00" in unpaid_section
+
+
+def test_part_paid_row_keeps_the_order_total_as_context():
+    """
+    ₹28,879.00 against a ₹9.4 lakh invoice reads as a data error without it.
+    """
+    _, html = _build_digest([], [_unpaid(amt=946596.0, status=2, paid=917717.0)], [])
+    assert "of ₹946,596.00" in html
+
+
+def test_unpaid_column_is_labelled_outstanding():
+    """The header has to say what the number means, now that it isn't the total."""
+    _, html = _build_digest([], [_unpaid()], [])
+    assert "Outstanding" in html
 
 
 def test_section_counts_reflect_actual_row_counts():
@@ -188,12 +259,14 @@ def _mock_db_with(wo_rows, unpaid_rows, delivery_rows):
     def execute_side_effect(query, params=None):
         result = MagicMock()
         sql = str(query)
-        if "work_orders" in sql:
-            result.mappings.return_value.all.return_value = wo_rows
-        elif "sales_orders" in sql and "payment_status = ANY" in sql:
-            result.mappings.return_value.all.return_value = unpaid_rows
-        elif "sales_orders" in sql and "delivery_date BETWEEN" in sql:
+        # Both the open-work-order and the upcoming-delivery query read
+        # work_orders now, so the delivery window has to be matched first.
+        if "delivery_date BETWEEN" in sql:
             result.mappings.return_value.all.return_value = delivery_rows
+        elif "work_orders" in sql:
+            result.mappings.return_value.all.return_value = wo_rows
+        elif "payment_status = ANY" in sql:
+            result.mappings.return_value.all.return_value = unpaid_rows
         else:
             result.mappings.return_value.all.return_value = []
         return result

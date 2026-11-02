@@ -12,37 +12,48 @@ three sections:
     2. Unpaid sales orders    — every order with payment_status IN (1, 2)
                                  ("Not Received" / "Partially Received"), a
                                  standing list like open work orders, not a
-                                 one-time alert. Deliberately excludes orders
-                                 where payment_status IS NULL: 713 orders from
-                                 the original bulk import were never given a
-                                 real payment status at all, and are not the
-                                 same thing as an order someone actually
-                                 assessed as unpaid — including them would
-                                 make this section 760 rows of mostly noise
-                                 instead of 47 rows of real signal. This
+                                 one-time alert. The money column is what is
+                                 still *owed*, not the order value: for a
+                                 Partially Received order that is
+                                 total_amount - payment_amount, since the
+                                 part-payment is recorded. Deliberately
+                                 excludes orders where payment_status IS NULL:
+                                 713 orders from the original bulk import were
+                                 never given a real payment status at all, and
+                                 are not the same thing as an order someone
+                                 actually assessed as unpaid — including them
+                                 would make this section 760 rows of mostly
+                                 noise instead of 47 rows of real signal. This
                                  originally ran as an exact-day trigger (see
                                  migration 010 / offers.reminder_sent_at for
                                  that pattern) but was changed to a standing
                                  list; payment_reminder_sent_at is no longer
                                  written by this job.
 
-    3. Upcoming deliveries    — orders with delivery_date within the next 5
-                                 days (today through today+5 inclusive),
-                                 regardless of dispatch_status. Deliberately
-                                 recurring, not deduplicated: the same order
-                                 is expected to appear on consecutive days as
-                                 its delivery date approaches, which is useful
-                                 planning information rather than spam.
-                                 actual_delivery_date is never populated
-                                 anywhere in this table (0 of 851 rows at the
-                                 time this was built), so it cannot be used to
-                                 detect "already delivered" — dispatch_status
-                                 was considered as a filter but explicitly
-                                 rejected: all 6 real matches on the day this
-                                 was built were already dispatch_status=4, and
-                                 the decision was that upcoming-delivery-date
-                                 is calendar information worth surfacing either
-                                 way.
+    3. Upcoming deliveries    — work orders with delivery_date within the next
+                                 5 days (today through today+5 inclusive),
+                                 each with whether the work order is completed
+                                 or still in progress. Driven by the work
+                                 order rather than the sales order because the
+                                 work order is where the promised delivery
+                                 date is actually maintained (1022 of 1034
+                                 work orders carry one), and because what the
+                                 team needs to see is whether the thing due to
+                                 go out is actually finished.
+
+                                 Deliberately recurring, not deduplicated: the
+                                 same work order is expected to appear on
+                                 consecutive days as its delivery date
+                                 approaches, which is useful planning
+                                 information rather than spam. Completed work
+                                 orders are listed too — "due Thursday, and
+                                 done" is exactly as much a planning fact as
+                                 "due Thursday, not started", and hiding them
+                                 would make a short list look alarming.
+                                 Expect overlap with section 1: an in-progress
+                                 work order due this week appears in both, by
+                                 design — section 1 is "what is open", this is
+                                 "what is due".
 
 Run standalone:
 
@@ -78,7 +89,12 @@ DIGEST_RECIPIENT = "accounts@esafe.co.in"
 UNPAID_PAYMENT_STATUSES = (1, 2)
 
 PAYMENT_STATUS_LABEL = {1: "Not Received", 2: "Partially Received", 3: "Received"}
-DISPATCH_STATUS_LABEL = {1: "Not Dispatched", 3: "Partial Dispatch", 4: "Fully Dispatched"}
+
+#: payment_status 2 = Partially Received, the one state where part of the money
+#: is already in and the outstanding figure differs from the order total.
+PARTIALLY_RECEIVED = 2
+
+WORK_ORDER_STATUS_LABEL = {"completed": "Completed", "in-progress": "In Progress"}
 
 
 _OPEN_WORK_ORDERS_SQL = text(
@@ -92,25 +108,68 @@ _OPEN_WORK_ORDERS_SQL = text(
 
 _UNPAID_SALES_ORDERS_SQL = text(
     """
-    SELECT id, invoice_number, company_name, sales_date, total_amount, payment_status
+    SELECT id, invoice_number, company_name, sales_date, total_amount, payment_status,
+           payment_amount
     FROM sales_orders
     WHERE payment_status = ANY(:statuses)
     ORDER BY sales_date ASC
     """
 )
 
+#: Driven by work_orders.delivery_date, not sales_orders.delivery_date — see
+#: section 3 of the module docstring.
 _UPCOMING_DELIVERIES_SQL = text(
     """
-    SELECT id, invoice_number, company_name, delivery_date, total_amount, dispatch_status
-    FROM sales_orders
+    SELECT id, work_order_number, party_name, delivery_date, status
+    FROM work_orders
     WHERE delivery_date BETWEEN CURRENT_DATE AND CURRENT_DATE + INTERVAL '1 day' * :window_days
-    ORDER BY delivery_date ASC
+    ORDER BY delivery_date ASC, work_order_number ASC
     """
 )
 
 
 def _fmt_money(amount: float) -> str:
     return f"₹{amount:,.2f}"
+
+
+def _outstanding(order: dict) -> float:
+    """
+    What is still owed on an unpaid sales order.
+
+    For "Not Received" that is the whole order. For "Partially Received" the
+    part-payment is recorded in payment_amount, so the outstanding figure is
+    the remainder — what someone chasing the payment actually needs to ask for.
+
+    Defensive on two counts: a Partially Received order with no payment_amount
+    recorded falls back to the full total (nothing is known to have come in, so
+    claiming it is paid off would be the worse error), and the result is never
+    negative. Neither case exists in the data today — the payment endpoint
+    rejects an amount above the order total — but this runs unattended against
+    a table with legacy rows in it.
+    """
+    total = float(order.get("total_amount") or 0)
+    if order.get("payment_status") != PARTIALLY_RECEIVED:
+        return total
+    received = order.get("payment_amount")
+    if received is None:
+        return total
+    return max(total - float(received), 0.0)
+
+
+def _outstanding_cell(order: dict) -> str:
+    """
+    The Outstanding cell. On a part-paid order the order value is shown beside
+    the remainder, greyed out — without it a row reading "₹28,879.00" against a
+    ₹9.4 lakh invoice looks like a data error rather than a part-payment.
+    """
+    outstanding = _fmt_money(_outstanding(order))
+    if order.get("payment_status") != PARTIALLY_RECEIVED:
+        return escape(outstanding)
+    total = _fmt_money(float(order.get("total_amount") or 0))
+    return (
+        f"{escape(outstanding)} "
+        f"<span style='color:#888'>of {escape(total)}</span>"
+    )
 
 
 def _fmt_date(d) -> str:
@@ -170,13 +229,13 @@ def _build_digest(
     )
 
     unpaid_table = _table(
-        ["Invoice", "Company", "Order Date", "Amount", "Payment Status"],
+        ["Invoice", "Company", "Order Date", "Outstanding", "Payment Status"],
         [
             [
                 escape(str(u["invoice_number"])),
                 escape(str(u["company_name"] or "—")),
                 _fmt_date(u["sales_date"]),
-                _fmt_money(float(u["total_amount"])),
+                _outstanding_cell(u),
                 escape(PAYMENT_STATUS_LABEL.get(u["payment_status"], "Unknown")),
             ]
             for u in unpaid
@@ -185,17 +244,17 @@ def _build_digest(
     )
 
     delivery_table = _table(
-        ["Invoice", "Company", "Delivery Date", "Dispatch Status"],
+        ["Work Order", "Party", "Delivery Date", "Status"],
         [
             [
-                escape(str(d["invoice_number"])),
-                escape(str(d["company_name"] or "—")),
+                escape(str(d["work_order_number"])),
+                escape(str(d["party_name"] or "—")),
                 _fmt_date(d["delivery_date"]),
-                escape(DISPATCH_STATUS_LABEL.get(d["dispatch_status"], "Unknown")),
+                escape(WORK_ORDER_STATUS_LABEL.get(d["status"], str(d["status"] or "Unknown"))),
             ]
             for d in deliveries
         ],
-        f"No sales orders due for delivery in the next {DELIVERY_WINDOW_DAYS} days.",
+        f"No work orders due for delivery in the next {DELIVERY_WINDOW_DAYS} days.",
     )
 
     html = f"""
@@ -228,9 +287,13 @@ def run(dry_run: bool) -> int:
         deliveries = _fetch_upcoming_deliveries(db)
 
         logger.info(
-            "Ops digest: %d open work order(s), %d unpaid sales order(s), "
-            "%d delivery(ies) due within %d days",
-            len(work_orders), len(unpaid), len(deliveries), DELIVERY_WINDOW_DAYS,
+            "Ops digest: %d open work order(s), %d unpaid sales order(s) "
+            "(%s outstanding), %d work order(s) due for delivery within %d days",
+            len(work_orders),
+            len(unpaid),
+            _fmt_money(sum(_outstanding(u) for u in unpaid)),
+            len(deliveries),
+            DELIVERY_WINDOW_DAYS,
         )
 
         subject, html = _build_digest(work_orders, unpaid, deliveries)

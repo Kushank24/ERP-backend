@@ -185,10 +185,11 @@ def _round_off_inputs(db: Session, po_id: int) -> tuple[float, str]:
     lines + extra costs, plus GST on that sum — the figure the detail screen and
     the PDF show before any round-off.
 
-    Note this is *not* `purchase_orders.total_amount`, which by long-standing
-    convention here holds the pre-GST figure (lines + extra costs). The
-    round-off is a correction to the grand total, so it is derived from this
-    value and kept in its own column rather than folded into total_amount.
+    This is also what `total_amount` holds, GST included, matching
+    sales_orders.total_amount. 473 of the 637 purchase orders carrying a GST
+    rate store a GST-inclusive total; the write paths here had drifted to
+    storing the pre-GST line sum instead, which is why editing a GST rate used
+    to leave every stored total untouched.
 
     One query rather than three: this runs on every edit, and the database is
     remote, so each extra round trip is latency the user waits through.
@@ -219,18 +220,28 @@ def _round_off_inputs(db: Session, po_id: int) -> tuple[float, str]:
     return base, normalize_mode(row["round_off_mode"])
 
 
-def _reapply_round_off(db: Session, po_id: int, mode: Optional[str] = None) -> None:
+def _recompute_total(db: Session, po_id: int, mode: Optional[str] = None) -> None:
     """
-    Re-derive the stored round-off delta from the order's current base grand
-    total. Pass `mode` to also set the direction (the round-off endpoint); omit
-    it to keep the stored one, which is what every other edit does — lines,
-    extra costs and GST rate all move the base, and the delta has to follow.
+    Recompute total_amount from the order's current lines, extra costs and GST
+    rate, and re-derive the round-off delta against that base.
+
+    Every write path funnels through here rather than computing a total of its
+    own — the drift that made an edited GST rate invisible came from three
+    separate call sites each deciding for themselves what a total was.
+
+    Pass `mode` to also set the round-off direction (the round-off endpoint);
+    omit it to keep the stored one, since lines, extra costs and the GST rate
+    all move the base and the delta has to follow.
     """
     base, stored_mode = _round_off_inputs(db, po_id)
     mode = normalize_mode(mode) if mode is not None else stored_mode
+    delta = compute_round_off(base, mode)
     db.execute(
-        text("UPDATE purchase_orders SET round_off_mode = :mode, round_off = :ro WHERE id = :id"),
-        {"mode": mode, "ro": compute_round_off(base, mode), "id": po_id},
+        text(
+            "UPDATE purchase_orders SET round_off_mode = :mode, round_off = :ro, "
+            "total_amount = :total WHERE id = :id"
+        ),
+        {"mode": mode, "ro": delta, "total": round(base, 2) + delta, "id": po_id},
     )
 
 
@@ -315,7 +326,10 @@ def create_po(
     if exists:
         raise HTTPException(400, "Purchase number already exists")
 
-    total = sum(float(l.length_weight_nos) * float(l.per_unit_cost) for l in body.lines)
+    # GST-inclusive, matching what total_amount means everywhere it is read
+    # (the list's Amount column, the dashboard) and what sales_orders stores.
+    lines_total = sum(float(l.length_weight_nos) * float(l.per_unit_cost) for l in body.lines)
+    total = lines_total + lines_total * (float(body.gst_rate) / 100.0)
     sid = _supplier_id(db, body.supplier_name, body.supplier_location, body.supplier_contact, body.supplier_gstin)
 
     row = db.execute(
@@ -342,7 +356,6 @@ def create_po(
     po_id = row[0]
 
     for line in body.lines:
-        line_total = float(line.length_weight_nos) * float(line.per_unit_cost)
         db.execute(
             text(
                 """
@@ -407,11 +420,9 @@ def update_po(
         if lid not in incoming_ids:
             db.execute(text("DELETE FROM purchase_order_lines WHERE id = :id"), {"id": lid})
 
-    # Update / insert lines
-    new_total = 0.0
+    # Update / insert lines. The total is not accumulated here — _recompute_total
+    # reads it back from the table below, so there is one definition of it.
     for line in body.lines:
-        line_total = float(line.length_weight_nos) * float(line.per_unit_cost)
-        new_total += line_total
         if line.id and line.id in current_lines:
             # Validate: new qty must cover already-delivered qty
             delivered = float(current_lines[line.id]["delivered_qty"] or 0)
@@ -445,16 +456,17 @@ def update_po(
             "UPDATE purchase_orders "
             "SET supplier_id=:sid, order_delivery_date=:deldate, gst_rate=:gst, "
             "delivery_details=CAST(:details AS jsonb), remarks=:remarks, "
-            "total_amount=:total, updated_at=now() WHERE id=:id"
+            "updated_at=now() WHERE id=:id"
         ),
         {
             "sid": sid, "deldate": body.order_delivery_date, "gst": body.gst_rate,
             "details": json.dumps(body.delivery_details or {}), "remarks": body.remarks,
-            "total": new_total, "id": po_id,
+            "id": po_id,
         },
     )
-    # The base grand total just moved — re-derive the round-off delta for it.
-    _reapply_round_off(db, po_id)
+    # Derives total_amount from the lines and the GST rate just written — the
+    # GST rate has to be in the table before the total is computed from it.
+    _recompute_total(db, po_id)
     db.commit()
     cache_bust("po")
     return _serialize_po(db, po_id)
@@ -646,18 +658,14 @@ def update_additional_costs(po_id: int, body: AdditionalCostsBody, db: Session =
     _ = user
     if not db.execute(text("SELECT id FROM purchase_orders WHERE id = :id"), {"id": po_id}).first():
         raise HTTPException(404, "Purchase order not found")
-    lines_total = db.execute(
-        text("SELECT COALESCE(SUM(length_weight_nos * per_unit_cost), 0) FROM purchase_order_lines WHERE purchase_order_id = :id"),
-        {"id": po_id},
-    ).scalar()
-    extra = sum(float(i.amount) for i in body.items)
-    new_total = float(lines_total or 0) + extra
     items_json = json.dumps([{"label": i.label, "amount": i.amount} for i in body.items])
     db.execute(
-        text("UPDATE purchase_orders SET additional_costs = CAST(:ac AS jsonb), total_amount = :total, updated_at = now() WHERE id = :id"),
-        {"ac": items_json, "total": new_total, "id": po_id},
+        text("UPDATE purchase_orders SET additional_costs = CAST(:ac AS jsonb), updated_at = now() WHERE id = :id"),
+        {"ac": items_json, "id": po_id},
     )
-    _reapply_round_off(db, po_id)
+    # total_amount is derived from the costs just written — GST applies to the
+    # extra costs too, which the old inline computation here left out.
+    _recompute_total(db, po_id)
     db.commit()
     cache_bust("po")
     return _serialize_po(db, po_id)
@@ -676,9 +684,9 @@ def update_round_off(po_id: int, body: RoundOffBody, db: Session = Depends(get_d
     derived from the server's own base grand total.
     """
     _ = user
-    # _reapply_round_off raises 404 itself if the order is gone, so this is a
+    # _recompute_total raises 404 itself if the order is gone, so this is a
     # single SELECT + single UPDATE — no separate existence check.
-    _reapply_round_off(db, po_id, mode=body.mode)
+    _recompute_total(db, po_id, mode=body.mode)
     db.commit()
     cache_bust("po")
     return _serialize_po(db, po_id)

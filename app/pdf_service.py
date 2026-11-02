@@ -273,11 +273,13 @@ class PDFGenerationService:
         extra_costs = data.get("AdditionalCosts") or []
         extra_total = sum(float(ec.get("amount", 0)) for ec in extra_costs)
 
+        # Always a percentage, never a fraction. The old "if > 1, divide by 100"
+        # guess was meant to tolerate either form, but every gst_rate in the
+        # table is a whole percentage, and the guess silently turned the real
+        # rates at or below 1% (0.25%, 1%) into 25% and 100%.
         gst_pct = float(data.get("PurchaseGST", 18))
-        if gst_pct > 1:
-            gst_pct /= 100
         gst_base = subtotal + extra_total
-        gst_amt = gst_base * gst_pct
+        gst_amt = gst_base * (gst_pct / 100.0)
         round_off = float(data.get("RoundOff") or 0)
         total = gst_base + gst_amt + round_off
 
@@ -292,7 +294,8 @@ class PDFGenerationService:
         rows.append(["SUBTOTAL", "", "", "", "", f"Rs.{subtotal:.2f}"])
         for ec in extra_costs:
             rows.append([ec.get("label", "Extra Cost"), "", "", "", "", f"Rs.{float(ec.get('amount', 0)):.2f}"])
-        rows.append([f"GST ({int(gst_pct * 100)}%)", "", "", "", "", f"Rs.{gst_amt:.2f}"])
+        # :g, not int() — a 17.5% rate must not print as "17%".
+        rows.append([f"GST ({gst_pct:g}%)", "", "", "", "", f"Rs.{gst_amt:.2f}"])
         if has_round_off:
             rows.append(["ROUND OFF", "", "", "", "", f"Rs.{round_off:+.2f}"])
         rows.append(["TOTAL", "", "", "", "", f"Rs.{total:.2f}"])
